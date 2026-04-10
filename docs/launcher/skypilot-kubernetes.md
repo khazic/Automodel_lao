@@ -9,9 +9,9 @@ You will:
 3. Scale the same job to two nodes.
 4. Follow logs and clean everything up when you are done.
 
-This guide is written for new AutoModel users, so it keeps the moving pieces as small as possible.
+This guide is written for new AutoModel users, so it keeps moving parts to a minimum.
 
-## Before you begin
+## Before You Begin
 
 You need:
 
@@ -21,7 +21,7 @@ You need:
 - a local NeMo AutoModel checkout
 - a Hugging Face token in `HF_TOKEN` if you plan to use a gated model such as Llama
 
-If you are setting up SkyPilot on Kubernetes for the first time, the official SkyPilot Kubernetes setup guide is here:
+If you are setting up SkyPilot on Kubernetes for the first time, see the official SkyPilot Kubernetes setup guide:
 
 - <https://docs.skypilot.co/en/latest/reference/kubernetes/kubernetes-setup.html>
 
@@ -37,7 +37,7 @@ Set the token once in your shell:
 export HF_TOKEN=hf_your_token_here
 ```
 
-## Step 1: Verify the cluster
+## Step 1: Verify the Cluster
 
 Start with three quick checks:
 
@@ -71,9 +71,9 @@ gpu-node-a                 H100   8 of 8 free
 
 If you do not see any GPUs here, stop and fix the Kubernetes or SkyPilot setup first. AutoModel is ready, but SkyPilot still cannot place GPU jobs.
 
-## Step 2: Run a single-node job
+## Step 2: Run a Single-Node Job
 
-The easiest starting point is a one-GPU fine-tune using the existing Llama 3.2 1B SQuAD example.
+The easiest starting point is a one-GPU fine-tuning job using the existing Llama 3.2 1B SQuAD example.
 
 This repository now includes a Kubernetes-flavored SkyPilot config at [`examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml`](../../examples/llm_finetune/llama3_2/llama3_2_1b_squad_skypilot_kubernetes.yaml).
 
@@ -134,7 +134,7 @@ torchrun --nproc_per_node=1 ~/sky_workdir/nemo_automodel/recipes/llm/train_ft.py
 ...
 ```
 
-## Step 3: Scale to two nodes
+## Step 3: Scale to Two Nodes
 
 Once the single-node job works, scaling out is just a small YAML change.
 
@@ -187,7 +187,7 @@ What you want to see:
 - both pods scheduled onto GPU nodes
 - logs that include `--nnodes=$SKYPILOT_NUM_NODES`
 
-## Step 4: Clean up
+## Step 4: Clean Up
 
 When the run is finished, tear the cluster down so it stops consuming resources:
 
@@ -202,21 +202,23 @@ You can remove old local launcher artifacts too:
 rm -rf skypilot_jobs
 ```
 
-## Common first-run issues
+## Common First-Run Issues
 
-### `sky check kubernetes` fails
+The following issues are the most common when getting started with SkyPilot on Kubernetes.
+
+### `sky check kubernetes` Fails
 
 Usually this means SkyPilot cannot use your current kubeconfig context yet. Re-check the context with `kubectl config current-context`, then compare it with SkyPilot's Kubernetes setup guide.
 
-### `sky show-gpus --infra k8s` shows no GPUs
+### `sky show-gpus --infra k8s` Shows No GPUs
 
 SkyPilot can only schedule GPUs that Kubernetes exposes. Make sure the GPU device plugin or operator is installed and the GPU nodes are healthy.
 
-### The job starts, but model download fails
+### The Job Starts, but Model Download Fails
 
 For gated models, make sure `HF_TOKEN` is exported in the shell that runs `automodel`. The SkyPilot launcher forwards it to the remote job.
 
-### Multi-node launch stalls during rendezvous
+### Multi-Node Launch Stalls during Rendezvous
 
 Start with the single-node example first. If that works, check that:
 
@@ -224,7 +226,7 @@ Start with the single-node example first. If that works, check that:
 - worker pods can talk to each other over the cluster network
 - the logs include the generated `torchrun` multi-node arguments shown above
 
-## Which file should I edit?
+## Which File Should I Edit?
 
 If you want to adapt this tutorial for your own model, the quickest path is:
 
