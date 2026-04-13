@@ -1060,8 +1060,14 @@ class TestBuildModelRetryDepth:
             assert result is sentinel_model
             assert mock_init.call_count == 2
 
-    def test_meta_tensor_tie_weights_error_retries_without_meta_device(self):
-        """NotImplementedError from torch.equal on meta tensors (tie_weights in transformers v5.5+) triggers retry."""
+    def test_aten_equal_not_implemented_error_retries_without_meta_device(self):
+        """NotImplementedError for aten::equal on meta tensors triggers retry without meta device.
+
+        Reproduces the failure introduced by transformers >= 5.4.0 which added a
+        torch.equal() call inside tie_weights() (HF PR #44497). When the model is
+        initialised inside init_empty_weights() the tensors are on the meta device
+        and torch.equal() raises NotImplementedError.
+        """
         build_kwargs, mock_config = self._make_build_kwargs()
         sentinel_model = MagicMock()
         with (
