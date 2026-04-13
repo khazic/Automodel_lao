@@ -367,11 +367,10 @@ class _BaseNeMoAutoModelClass(_BaseAutoModelClass):
                     **kwargs,
                 )
         except (NotImplementedError, RuntimeError) as e:
-            # introduced in transformers v5.4+: "attempted to run this operator with Meta tensors"
             _meta_err_msgs = (
                 "Cannot copy out of meta tensor",
                 "cannot be called on meta tensors",
-                "attempted to run this operator with Meta tensors",
+                "aten::equal: attempted to run this operator with Meta tensors",
             )
             if any(msg in str(e) for msg in _meta_err_msgs) and is_meta_device:
                 logger.warning(
