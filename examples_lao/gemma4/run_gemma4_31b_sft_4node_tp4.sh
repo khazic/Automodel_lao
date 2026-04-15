@@ -41,6 +41,8 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export PYTHONFAULTHANDLER=1
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
+# Synchronise CUDA ops so errors point to the actual failing kernel (debug only)
+export CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-1}
 
 mkdir -p \
     "${TMPDIR}" "${HF_HOME}" "${TRANSFORMERS_CACHE}" \

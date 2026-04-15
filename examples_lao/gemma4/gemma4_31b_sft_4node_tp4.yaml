@@ -75,7 +75,7 @@ distributed:
   cp_size: 1
   # sequence_parallel not yet supported for Gemma4 (silently ignored if set).
   sequence_parallel: false
-  activation_checkpointing: true
+  activation_checkpointing: false
 
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
