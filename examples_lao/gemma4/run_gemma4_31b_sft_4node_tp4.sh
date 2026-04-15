@@ -15,8 +15,9 @@ REPO_ROOT=${REPO_ROOT:-/llm-align/liuchonghan/Automodel_lao}
 CONFIG=${CONFIG:-examples_lao/gemma4/gemma4_31b_sft_4node_tp4.yaml}
 VENV_DIR=${VENV_DIR:-${REPO_ROOT}/.venv}
 
-MASTER_ADDR=${MASTER_ADDR:-10.178.157.101}
-MASTER_PORT=${MASTER_PORT:-8881}
+# Force-override any platform-injected MASTER_ADDR/PORT (e.g. K8s env vars).
+MASTER_ADDR=10.178.157.101
+MASTER_PORT=8881
 NNODES=${NNODES:-4}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 NODE_RANK=${NODE_RANK:?'NODE_RANK must be set (0=master, 1, 2, 3)'}
