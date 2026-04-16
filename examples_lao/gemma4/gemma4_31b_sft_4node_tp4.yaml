@@ -49,8 +49,7 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
   pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-31B-it
   torch_dtype: torch.bfloat16
-  # liger kernel is incompatible with TP4 DTensor sharding
-  use_liger_kernel: false
+  use_liger_kernel: true
   use_sdpa_patching: false
   attn_implementation: sdpa
   text_config:
@@ -59,7 +58,7 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_4node_tp4/
-  model_save_format: safetensors
+  model_save_format: torch_save
   save_consolidated: false
 
 distributed:
