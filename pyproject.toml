@@ -80,7 +80,7 @@ dependencies = [
     "opencv-python-headless==4.10.0.84",
     "pybind11",
     "pyyaml",
-    "torch>=2.6.0,<=2.10.0",
+    "torch>=2.6.0,<=2.11.0",
     "torchdata",
     "transformers==5.5.0",
     "wandb",
@@ -159,7 +159,7 @@ automodel = "nemo_automodel.cli.app:main"
 am = "nemo_automodel.cli.app:main"
 
 [dependency-groups]
-build = ["setuptools", "torch<=2.10.0", "packaging", "psutil"]
+build = ["setuptools", "torch<=2.11.0", "packaging", "psutil"]
 docs = [
     "sphinx",
     "sphinx-autobuild",    # For live doc serving while editing docs
@@ -227,12 +227,12 @@ liger-kernel = { git = "https://github.com/linkedin/Liger-Kernel.git", rev = "1f
 onnxruntime-gpu = { index = "onnxruntime-cuda-13" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
   { index = "pytorch-cpu", marker = "sys_platform != 'linux' and sys_platform != 'darwin'" },
-  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+  { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
 
