@@ -39,6 +39,8 @@ export HF_TOKEN=${HF_TOKEN:-}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export PYTHONFAULTHANDLER=1
+# Uncomment below to get synchronous CUDA errors (slower, but shows exact crash location):
+# export CUDA_LAUNCH_BLOCKING=1
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export PYTORCH_ALLOC_CONF=${PYTORCH_ALLOC_CONF:-expandable_segments:True}
 
