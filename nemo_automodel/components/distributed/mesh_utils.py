@@ -409,3 +409,50 @@ def get_submesh(device_mesh: "DeviceMesh", names: tuple) -> "DeviceMesh":
         f"No parent flattened mesh found for dims {names} with target size {target}. "
         f"Available: {set(root._flatten_mapping)}"
     )
+
+
+def get_fsdp_dp_mesh(
+    device_mesh: "DeviceMesh",
+    dp_replicate_name: str = "dp_replicate",
+    dp_shard_cp_name: str = "dp_shard_cp",
+) -> "DeviceMesh":
+    """Return the DP mesh for FSDP2 that shares the same root as the TP mesh.
+
+    FSDP2 asserts that the DP mesh and TP/EP mesh must have the same
+    ``_get_root_mesh()``.  ``get_submesh()`` with flattened dim names (e.g.
+    ``dp_shard_cp``) goes through ``_unflatten`` which creates a new
+    DeviceMesh with NO parent — its root is itself, not the original 5-D
+    mesh.  This function avoids that by using only native (non-flattened)
+    mesh dimensions that are direct children of the original root mesh.
+
+    Logic:
+    - cp=1, dp_replicate=1  →  ``device_mesh["dp_shard"]``          (1-D)
+    - cp=1, dp_replicate>1  →  ``device_mesh[("dp_replicate", "dp_shard")]``  (2-D HSDP)
+    - cp>1, dp_replicate=1  →  ``device_mesh[("dp_shard", "cp")]``   (2-D)
+    - cp>1, dp_replicate>1  →  falls back to ``get_submesh``          (best-effort)
+    """
+    dp_shard_name = MeshAxisName.DP_SHARD
+    cp_name = MeshAxisName.CP
+
+    native_dims_available = (
+        dp_shard_name in device_mesh.mesh_dim_names
+        and cp_name in device_mesh.mesh_dim_names
+        and dp_replicate_name in device_mesh.mesh_dim_names
+    )
+
+    if native_dims_available:
+        cp_size = device_mesh[cp_name].size()
+        dp_replicate_size = device_mesh[dp_replicate_name].size()
+
+        if dp_replicate_size > 1 and cp_size > 1:
+            # Both HSDP and CP: fall back to get_submesh (complex case)
+            pass
+        elif dp_replicate_size > 1:
+            return device_mesh[(dp_replicate_name, dp_shard_name)]
+        elif cp_size > 1:
+            return device_mesh[(dp_shard_name, cp_name)]
+        else:
+            return device_mesh[dp_shard_name]
+
+    # Fallback for non-standard mesh configurations
+    return get_submesh(device_mesh, (dp_replicate_name, dp_shard_cp_name))
