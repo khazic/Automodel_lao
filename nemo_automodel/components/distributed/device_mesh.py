@@ -40,7 +40,6 @@ from nemo_automodel.components.distributed.config import (
     FSDP2Config,
     MegatronFSDPConfig,
 )
-from nemo_automodel.components.distributed.mesh_utils import _unflatten_compat
 
 
 def create_device_mesh(
@@ -225,8 +224,7 @@ def _create_fsdp2_device_mesh(
     moe_mesh = None
     if ep_size > 1:
         non_pp_mesh = device_mesh[("dp_replicate", "dp_shard", "cp", "tp")]._flatten()
-        moe_mesh = _unflatten_compat(
-            non_pp_mesh,
+        moe_mesh = non_pp_mesh._unflatten(
             0,
             (ep_shard_size, ep_size),
             ("ep_shard", "ep"),
