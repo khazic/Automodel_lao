@@ -14,12 +14,11 @@
 
 """Tests for mesh_utils: get_flat_mesh, get_submesh utilities."""
 
-from unittest.mock import Mock, PropertyMock
+from unittest.mock import Mock
 
 import pytest
 
-from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh, get_submesh
-
+from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh, get_fsdp_dp_mesh, get_submesh
 
 # ---------------------------------------------------------------------------
 # get_flat_mesh
@@ -48,7 +47,7 @@ class TestGetFlatMesh:
 
     def test_mesh_dim_returns_direct_slice(self):
         mesh = self._make_mock_mesh(("dp", "tp"))
-        result = get_flat_mesh(mesh, "tp")
+        get_flat_mesh(mesh, "tp")
         mesh.__getitem__.assert_called_once_with("tp")
         # Should NOT call _get_root_mesh for direct mesh dims
         mesh._get_root_mesh.assert_not_called()
@@ -110,7 +109,7 @@ class TestGetSubmesh:
 
     def test_single_physical_dim_delegates_to_get_flat_mesh(self):
         mesh = self._make_mock_mesh(("dp", "tp"))
-        result = get_submesh(mesh, ("tp",))
+        get_submesh(mesh, ("tp",))
         mesh.__getitem__.assert_called_once_with("tp")
 
     def test_single_flattened_dim_delegates_to_get_flat_mesh(self):
@@ -124,7 +123,7 @@ class TestGetSubmesh:
 
     def test_multi_dim_names_direct_slice(self):
         mesh = self._make_mock_mesh(("pp", "dp_replicate", "dp_shard", "cp", "tp"))
-        result = get_submesh(mesh, ("dp_replicate", "dp_shard"))
+        get_submesh(mesh, ("dp_replicate", "dp_shard"))
         mesh.__getitem__.assert_called_once_with(("dp_replicate", "dp_shard"))
 
     def test_mixed_physical_flattened_uses_unflatten(self, monkeypatch):
@@ -164,13 +163,76 @@ class TestGetSubmesh:
 
         result = get_submesh(mesh, ("dp_replicate", "dp_shard_cp"))
 
-        dp_cp_flat._unflatten.assert_called_once_with(
-            0, (2, 4), ("dp_replicate", "dp_shard_cp")
-        )
+        dp_cp_flat._unflatten.assert_called_once_with(0, (2, 4), ("dp_replicate", "dp_shard_cp"))
         assert result is unflatten_result
 
     def test_all_physical_multi_dim(self):
         """All-physical multi-dim tuple slices directly."""
         mesh = self._make_mock_mesh(("pp", "dp", "tp"))
-        result = get_submesh(mesh, ("dp", "tp"))
+        get_submesh(mesh, ("dp", "tp"))
         mesh.__getitem__.assert_called_once_with(("dp", "tp"))
+
+
+# ---------------------------------------------------------------------------
+# get_fsdp_dp_mesh
+# ---------------------------------------------------------------------------
+
+
+class TestGetFsdpDpMesh:
+    _DIMS = ("dp_replicate", "dp_shard", "cp", "tp")
+
+    def _make_mock_mesh(self, dim_names, sizes):
+        """Create a mock mesh where mesh[dim].size() returns sizes[dim]."""
+        mesh = Mock()
+        mesh.mesh_dim_names = dim_names
+
+        def getitem(key):
+            sub = Mock()
+            if isinstance(key, str) and key in sizes:
+                sub.size = Mock(return_value=sizes[key])
+            return sub
+
+        mesh.__getitem__ = Mock(side_effect=getitem)
+        return mesh
+
+    def test_dp_replicate_1_cp_1_returns_dp_shard(self):
+        mesh = self._make_mock_mesh(self._DIMS, {"dp_replicate": 1, "dp_shard": 1, "cp": 1})
+        result = get_fsdp_dp_mesh(mesh)
+        mesh.__getitem__.assert_called_with("dp_shard")
+        assert result is mesh.__getitem__.return_value
+
+    def test_dp_replicate_gt1_cp_1_returns_replicate_shard(self):
+        mesh = self._make_mock_mesh(self._DIMS, {"dp_replicate": 2, "dp_shard": 4, "cp": 1})
+        result = get_fsdp_dp_mesh(mesh)
+        mesh.__getitem__.assert_called_with(("dp_replicate", "dp_shard"))
+        assert result is mesh.__getitem__.return_value
+
+    def test_dp_replicate_1_cp_gt1_returns_shard_cp(self):
+        mesh = self._make_mock_mesh(self._DIMS, {"dp_replicate": 1, "dp_shard": 4, "cp": 2})
+        result = get_fsdp_dp_mesh(mesh)
+        mesh.__getitem__.assert_called_with(("dp_shard", "cp"))
+        assert result is mesh.__getitem__.return_value
+
+    def test_dp_replicate_gt1_cp_gt1_falls_back_to_get_submesh(self, monkeypatch):
+        """When both CP>1 and dp_replicate>1, falls back to get_submesh."""
+        mesh = self._make_mock_mesh(self._DIMS, {"dp_replicate": 2, "dp_shard": 4, "cp": 2})
+
+        submesh_result = Mock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.mesh_utils.get_submesh",
+            Mock(return_value=submesh_result),
+        )
+        result = get_fsdp_dp_mesh(mesh)
+        assert result is submesh_result
+
+    def test_native_dims_missing_falls_back_to_get_submesh(self, monkeypatch):
+        """When native dims are absent, falls back to get_submesh."""
+        mesh = self._make_mock_mesh(("dp_shard_cp", "tp"), {})
+
+        submesh_result = Mock()
+        monkeypatch.setattr(
+            "nemo_automodel.components.distributed.mesh_utils.get_submesh",
+            Mock(return_value=submesh_result),
+        )
+        result = get_fsdp_dp_mesh(mesh)
+        assert result is submesh_result
