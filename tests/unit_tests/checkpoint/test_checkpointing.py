@@ -28,6 +28,7 @@ from nemo_automodel.components.checkpoint.checkpointing import (
     _is_custom_model,
     _model_has_dtensors,
     _reinit_non_persistent_buffers,
+    _summarize_state_dict_key_diff,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import _get_lm_head_weight_and_name
 
@@ -76,6 +77,31 @@ def test_equally_divide_layers_num_shards_one():
 
     assert len(mapping) == len(keys)
     assert set(mapping.values()) == {1}
+
+
+def test_summarize_state_dict_key_diff_reports_missing_and_unexpected():
+    summary = _summarize_state_dict_key_diff(
+        {"a.weight", "b.bias", "c.weight"},
+        {"a.weight", "c.weight", "extra.weight"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 1
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["b.bias"]
+    assert summary["unexpected_examples"] == ["extra.weight"]
+
+
+def test_summarize_state_dict_key_diff_limits_examples():
+    summary = _summarize_state_dict_key_diff(
+        {"a", "b", "c", "d"},
+        {"x"},
+        limit=2,
+    )
+
+    assert summary["missing_count"] == 4
+    assert summary["unexpected_count"] == 1
+    assert summary["missing_examples"] == ["a", "b"]
 
 
 # =============================================================================

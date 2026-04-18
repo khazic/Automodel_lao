@@ -90,6 +90,23 @@ def _is_bin_checkpoint(path: str) -> bool:
     return len(glob.glob(os.path.join(path, "*.bin"))) > 0
 
 
+def _summarize_state_dict_key_diff(
+    expected_keys: set[str],
+    loaded_keys: set[str],
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Summarize state-dict key mismatches for checkpoint load diagnostics."""
+    missing = sorted(expected_keys - loaded_keys)
+    unexpected = sorted(loaded_keys - expected_keys)
+    return {
+        "missing_count": len(missing),
+        "unexpected_count": len(unexpected),
+        "missing_examples": missing[:limit],
+        "unexpected_examples": unexpected[:limit],
+    }
+
+
 if _is_geq_torch_2_9():
     from torch.distributed.checkpoint.staging import DefaultStager
     from torch.distributed.checkpoint.state_dict_saver import AsyncCheckpointerType, AsyncSaveResponse
@@ -447,6 +464,7 @@ class Checkpointer:
 
         # Standard loading path (DCP copies into model's existing tensors; dtypes follow the model)
         state_dict = model_state.state_dict()
+        expected_keys = set(state_dict.keys())
         # When the model has a state_dict_adapter, it handles all key transformations
         # (to_hf/from_hf). Passing key_mapping to the storage reader would double-transform
         # keys: the storage reader renames checkpoint keys in metadata, and then to_hf also
@@ -464,6 +482,17 @@ class Checkpointer:
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
+        key_diff = _summarize_state_dict_key_diff(expected_keys, set(state_dict.keys()))
+        if key_diff["missing_count"] or key_diff["unexpected_count"]:
+            logging.warning(
+                "Checkpoint key mismatch for %s: missing=%d unexpected=%d "
+                "(missing examples=%s, unexpected examples=%s)",
+                type(model_state.model[0]).__name__,
+                key_diff["missing_count"],
+                key_diff["unexpected_count"],
+                key_diff["missing_examples"],
+                key_diff["unexpected_examples"],
+            )
         model_state.load_state_dict(state_dict, strict=not (len(model_state.model) > 1 or has_state_dict_adapter))
 
         del state_dict

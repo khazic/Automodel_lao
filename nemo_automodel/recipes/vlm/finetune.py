@@ -937,6 +937,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     targets = None
 
                 input_ids = batch.pop("input_ids")
+                self.pp.update_seq_len(input_ids.shape[1])
 
                 # VLM: Custom chunking for pixel_values and image_grid
                 # These tensors have non-standard structure that can't be naively chunked by dim 0
