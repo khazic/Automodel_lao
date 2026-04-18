@@ -84,6 +84,7 @@ dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
   pin_memory: true
+  drop_last: true
   collate_fn:
     _target_: examples_lao/gemma4/parquet_messages_dataset.py:gemma4_prefix_truncating_collate_fn
     max_length: 1024
