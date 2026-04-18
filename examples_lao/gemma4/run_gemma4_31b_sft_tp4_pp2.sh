@@ -13,8 +13,8 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-/llm-align/liuchonghan/Automodel_lao}
 CONFIG=${CONFIG:-examples_lao/gemma4/gemma4_31b_sft_tp4_pp2.yaml}
-VENV_DIR=${VENV_DIR:-${REPO_ROOT}/.venv}
 NPROC_PER_NODE=${NPROC_PER_NODE:-8}
+TORCHRUN=${TORCHRUN:-/usr/local/bin/torchrun}
 
 export TMPDIR=${TMPDIR:-/llm-align/liuchonghan/tmp}
 export TEMP=${TEMP:-/llm-align/liuchonghan/tmp}
@@ -51,9 +51,8 @@ echo "NPROC_PER_NODE=${NPROC_PER_NODE}  (tp4 x pp2 = 8 GPUs)"
 echo "========================================"
 
 cd "${REPO_ROOT}"
-source "${VENV_DIR}/bin/activate"
 
-torchrun \
+"${TORCHRUN}" \
     --standalone \
     --nproc-per-node="${NPROC_PER_NODE}" \
     -m nemo_automodel.cli.app \
