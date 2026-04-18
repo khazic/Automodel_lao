@@ -13,7 +13,9 @@ set -euo pipefail
 
 REPO_ROOT=${REPO_ROOT:-/llm-align/liuchonghan/Automodel_lao}
 CONFIG=${CONFIG:-examples_lao/gemma4/gemma4_31b_sft_4node_tp4.yaml}
-VENV_DIR=${VENV_DIR:-${REPO_ROOT}/.venv}
+# Use the system Python (node image has torch + NCCL preinstalled).
+# Do NOT source .venv — its torch needs libcusparseLt.so.0 which is not
+# present on the worker image.
 
 # Force-override any platform-injected MASTER_ADDR/PORT (e.g. K8s env vars).
 MASTER_ADDR=10.178.157.101
@@ -60,7 +62,7 @@ echo "CONFIG=${CONFIG}"
 echo "========================================"
 
 cd "${REPO_ROOT}"
-source "${VENV_DIR}/bin/activate"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 
 torchrun \
     --nnodes="${NNODES}" \
