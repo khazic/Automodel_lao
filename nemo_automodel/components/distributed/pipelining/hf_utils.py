@@ -305,10 +305,18 @@ def create_pipeline_forward_gemma4_text() -> Callable:
                     position_embeddings_map[lt] = self.rotary_emb(inputs_embeds, position_ids)
 
         hidden_states = inputs_embeds
+        config_layer_types = getattr(self.config, "layer_types", None)
         if hasattr(self, "layers") and self.layers is not None:
             layer_iter = self.layers.values() if hasattr(self.layers, "values") else self.layers
             for decoder_layer in layer_iter:
-                layer_type = getattr(decoder_layer, "attention_type", "full_attention")
+                # Prefer config.layer_types[layer_idx] over decoder_layer attribute — the
+                # attribute lookup defaults to "full_attention" and mis-assigns position
+                # embeddings (wrong head_dim) to sliding-window layers.
+                if config_layer_types is not None and hasattr(decoder_layer, "layer_idx"):
+                    idx = decoder_layer.layer_idx
+                    layer_type = config_layer_types[idx] if idx < len(config_layer_types) else "full_attention"
+                else:
+                    layer_type = getattr(decoder_layer, "attention_type", "full_attention")
                 layer_attention_mask = causal_mask_mapping.get(
                     layer_type, causal_mask_mapping.get("full_attention")
                 )
