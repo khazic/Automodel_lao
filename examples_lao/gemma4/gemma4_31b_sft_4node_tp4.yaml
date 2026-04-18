@@ -57,7 +57,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_4node_tp4/
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_4node_tp4_plus_en2cn/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -77,6 +77,7 @@ dataset:
   path_or_dataset:
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dayuzhong_instruct_gemini3.1_5w.parquet
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dyz_trans_10w_gemini3.1.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/en2cn_mix_gemini3.1.parquet
   split: train
   shuffle_seed: 42
 
