@@ -52,7 +52,10 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
     requires_tensor_merging,
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
-from nemo_automodel.components.checkpoint.utils import is_tied_word_embeddings
+from nemo_automodel.components.checkpoint.utils import (
+    is_tied_word_embeddings,
+    materialize_missing_tied_lm_head,
+)
 
 if TYPE_CHECKING:
     from peft import PeftConfig
@@ -407,6 +410,16 @@ class Checkpointer:
         if is_init_step and model_type and requires_tensor_merging(model_type) and not has_state_dict_adapter:
             converted_state_dict = _convert_checkpoint_with_transformers(model_state.model[0], model_path, key_mapping)
             if converted_state_dict:
+                materialized_tied_lm_head = materialize_missing_tied_lm_head(
+                    converted_state_dict,
+                    model_state.model[0],
+                    allow_current_lm_head_fallback=False,
+                )
+                if materialized_tied_lm_head:
+                    logging.info(
+                        "Materialized missing tied lm_head.weight from embedding weights for %s during init load.",
+                        type(model_state.model[0]).__name__,
+                    )
                 # Load using full_state_dict=True to properly convert tensors to DTensors for FSDP
                 _load_full_state_dict_into_model(model_state.model, converted_state_dict)
                 return
@@ -442,6 +455,17 @@ class Checkpointer:
             # fail to load base weights when using strict=False.
             if key_mapping and state_dict_from_disk:
                 state_dict_from_disk = _apply_key_mapping(state_dict_from_disk, key_mapping)
+
+            materialized_tied_lm_head = materialize_missing_tied_lm_head(
+                state_dict_from_disk,
+                model_state.model[0],
+                allow_current_lm_head_fallback=False,
+            )
+            if materialized_tied_lm_head:
+                logging.info(
+                    "Materialized missing tied lm_head.weight from embedding weights for %s during init load.",
+                    type(model_state.model[0]).__name__,
+                )
 
             total_bytes = sum(
                 t.nelement() * t.element_size() for t in state_dict_from_disk.values() if isinstance(t, torch.Tensor)
