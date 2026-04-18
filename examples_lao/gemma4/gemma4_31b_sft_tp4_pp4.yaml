@@ -81,7 +81,7 @@ dataset:
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dayuzhong_instruct_gemini3.1_5w.parquet
   split: train
   shuffle_seed: 42
-  limit_dataset_samples: 5000
+  limit_dataset_samples: 20000
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
