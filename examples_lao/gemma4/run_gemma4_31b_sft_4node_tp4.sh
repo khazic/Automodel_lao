@@ -49,7 +49,7 @@ mkdir -p \
     "${TORCH_HOME}" "${TORCH_EXTENSIONS_DIR}" \
     "${TRITON_CACHE_DIR}" "${XDG_CACHE_HOME}" \
     "${WANDB_DIR}" "${WANDB_CACHE_DIR}" \
-    /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_4node_tp4
+    /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_4node_tp4_plus_en2cn
 
 echo "========================================"
 echo "HOSTNAME=$(hostname)"
