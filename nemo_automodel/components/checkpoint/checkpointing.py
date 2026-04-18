@@ -40,6 +40,7 @@ from nemo_automodel.components.checkpoint._backports.consolidate_hf_safetensors 
     consolidate_safetensors_files_on_every_rank,
 )
 from nemo_automodel.components.checkpoint._backports.filesystem import SerializationFormat
+from nemo_automodel.components.checkpoint._backports.filesystem import FileSystemReader
 from nemo_automodel.components.checkpoint._backports.hf_storage import (
     _HuggingFaceStorageReader,
     _HuggingFaceStorageWriter,
@@ -53,6 +54,7 @@ from nemo_automodel.components.checkpoint.conversion_mapping import (
 )
 from nemo_automodel.components.checkpoint.stateful_wrappers import ModelState, OptimizerState
 from nemo_automodel.components.checkpoint.utils import (
+    get_tied_lm_head_source_names,
     is_tied_word_embeddings,
     materialize_missing_tied_lm_head,
 )
@@ -108,6 +110,16 @@ def _summarize_state_dict_key_diff(
         "missing_examples": missing[:limit],
         "unexpected_examples": unexpected[:limit],
     }
+
+
+def _get_checkpoint_metadata_keys(
+    path: str,
+    storage_reader: Optional[_HuggingFaceStorageReader] = None,
+) -> set[str]:
+    """Return checkpoint FQNs present in metadata."""
+    reader = storage_reader if storage_reader is not None else FileSystemReader(path)
+    metadata = reader.read_metadata()
+    return set(metadata.state_dict_metadata.keys())
 
 
 if _is_geq_torch_2_9():
@@ -503,7 +515,45 @@ class Checkpointer:
             device_mesh=self.moe_mesh,
         )
 
+        compat_tied_lm_head_source_key: str | None = None
+        lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
+        should_try_tied_lm_head_compat = (
+            not is_init_step
+            and getattr(model_state, "uses_tied_lm_head", False)
+            and not getattr(model_state, "has_local_tied_lm_head", False)
+            and isinstance(lm_head_param_name, str)
+            and lm_head_param_name in state_dict
+        )
+        if should_try_tied_lm_head_compat:
+            checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
+            if lm_head_param_name not in checkpoint_metadata_keys:
+                for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
+                    if source_name not in checkpoint_metadata_keys or source_name in state_dict:
+                        continue
+                    compat_tied_lm_head_source_key = source_name
+                    state_dict[source_name] = state_dict.pop(lm_head_param_name)
+                    logging.warning(
+                        "Checkpoint %s is missing %s. Loading tied source %s into lm_head "
+                        "for backward compatibility; this checkpoint was likely saved "
+                        "before the PP tied-lm-head fix.",
+                        model_path,
+                        lm_head_param_name,
+                        source_name,
+                    )
+                    break
+                if compat_tied_lm_head_source_key is None:
+                    logging.warning(
+                        "Checkpoint %s is missing %s and no tied source key was found. "
+                        "Keeping the current lm_head initialization for compatibility.",
+                        model_path,
+                        lm_head_param_name,
+                    )
+                    state_dict.pop(lm_head_param_name, None)
+
         state_dict = self._do_load(state_dict, model_path, storage_reader, is_init_step=is_init_step)
+
+        if compat_tied_lm_head_source_key is not None and isinstance(lm_head_param_name, str):
+            state_dict[lm_head_param_name] = state_dict.pop(compat_tied_lm_head_source_key)
 
         state_dict = _maybe_adapt_state_dict_from_hf(model_state.model[0], state_dict, moe_mesh=self.moe_mesh)
         key_diff = _summarize_state_dict_key_diff(expected_keys, set(state_dict.keys()))

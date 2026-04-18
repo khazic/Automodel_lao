@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)",
+      "Bash(gh api:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(uv run:*)",
+      "Bash(python3 -c:*)",
+      "WebFetch(domain:github.com)",
+      "Read(/tmp/**)",
+      "Bash(pip show *)",
+      "Bash(gh run *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(gh pr *)"
+    ]
+  }
+}

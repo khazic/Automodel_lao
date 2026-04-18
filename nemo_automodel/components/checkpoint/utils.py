@@ -115,6 +115,48 @@ def get_input_embeddings_weight_and_name(model: nn.Module) -> tuple[torch.Tensor
     return None, None
 
 
+def get_tied_lm_head_source_names(model: nn.Module, lm_head_param_name: str | None = None) -> list[str]:
+    """Return candidate checkpoint keys that can source a tied LM head.
+
+    Args:
+        model: Model or pipeline stage to inspect.
+        lm_head_param_name: Optional normalized LM head FQN.
+
+    Returns:
+        Ordered list of possible source FQNs.
+    """
+    candidate_source_names: list[str] = []
+    tied_keys = getattr(model, "_tied_weights_keys", None)
+    if isinstance(tied_keys, dict):
+        for target_name, source_name in tied_keys.items():
+            if not isinstance(target_name, str) or not isinstance(source_name, str):
+                continue
+            if lm_head_param_name is None or target_name == lm_head_param_name or target_name.endswith("lm_head.weight"):
+                candidate_source_names.append(source_name)
+
+    _, input_embeddings_param_name = get_input_embeddings_weight_and_name(model)
+    if input_embeddings_param_name is not None:
+        candidate_source_names.append(input_embeddings_param_name)
+
+    candidate_source_names.extend(
+        [
+            "model.language_model.embed_tokens.weight",
+            "language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+        ]
+    )
+
+    seen_source_names: set[str] = set()
+    deduped_source_names: list[str] = []
+    for source_name in candidate_source_names:
+        if source_name in seen_source_names:
+            continue
+        seen_source_names.add(source_name)
+        deduped_source_names.append(source_name)
+    return deduped_source_names
+
+
 def has_local_tied_lm_head(model: nn.Module) -> bool:
     """Return whether the current model partition owns a truly tied LM head.
 
@@ -169,33 +211,7 @@ def materialize_missing_tied_lm_head(
     if lm_head_weight is None or lm_head_param_name is None or lm_head_param_name in state_dict:
         return False
 
-    candidate_source_names: list[str] = []
-    tied_keys = getattr(model, "_tied_weights_keys", None)
-    if isinstance(tied_keys, dict):
-        for target_name, source_name in tied_keys.items():
-            if not isinstance(target_name, str) or not isinstance(source_name, str):
-                continue
-            if target_name == lm_head_param_name or target_name.endswith("lm_head.weight"):
-                candidate_source_names.append(source_name)
-
-    _, input_embeddings_param_name = get_input_embeddings_weight_and_name(model)
-    if input_embeddings_param_name is not None:
-        candidate_source_names.append(input_embeddings_param_name)
-
-    candidate_source_names.extend(
-        [
-            "model.language_model.embed_tokens.weight",
-            "language_model.embed_tokens.weight",
-            "model.embed_tokens.weight",
-            "embed_tokens.weight",
-        ]
-    )
-
-    seen_source_names: set[str] = set()
-    for source_name in candidate_source_names:
-        if source_name in seen_source_names:
-            continue
-        seen_source_names.add(source_name)
+    for source_name in get_tied_lm_head_source_names(model, lm_head_param_name):
         tensor = state_dict.get(source_name)
         if isinstance(tensor, torch.Tensor):
             state_dict[lm_head_param_name] = tensor.detach()
