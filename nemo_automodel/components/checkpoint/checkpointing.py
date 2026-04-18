@@ -611,7 +611,12 @@ class Checkpointer:
         is_tied_lm_head = is_tied_word_embeddings(model)
         self.config.original_model_root_dir = root_dir
         if hasattr(model, "tie_weights") and is_tied_lm_head:
-            model.tie_weights()
+            try:
+                model.tie_weights()
+            except AttributeError:
+                # PP splitting sets unused modules to None; skip weight tying
+                # on stages that don't own both embed_tokens and lm_head.
+                pass
 
     def maybe_wait_for_staging(self) -> None:
         """
