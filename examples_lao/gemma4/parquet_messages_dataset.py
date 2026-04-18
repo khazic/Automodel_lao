@@ -316,17 +316,12 @@ def gemma4_prefix_truncating_collate_fn(
         if isinstance(value, torch.Tensor) and value.shape == input_shape and key != "labels":
             batch[key] = value[:, :-1]
 
-    # Drop samples whose assistant response was fully truncated (all labels == -100).
-    # This prevents nan loss / zero grad_norm when max_length cuts off the response.
-    # Guard: only filter if at least one valid sample remains; otherwise keep the
-    # whole batch as-is (a single nan step is safer than an empty-tensor crash).
+    # Do not shrink the batch here. PP schedules require a fixed number of
+    # microbatches per step, so dropping partially truncated samples can turn a
+    # batch of size 4 into 3 and crash the schedule.
     valid = (batch["labels"] != -100).any(dim=-1)  # [B]
-    if valid.any() and not valid.all():
-        for key in list(batch.keys()):
-            val = batch[key]
-            if isinstance(val, torch.Tensor) and val.dim() >= 1 and val.shape[0] == valid.shape[0]:
-                batch[key] = val[valid]
-        examples = [ex for ex, ok in zip(examples, valid.tolist()) if ok]
+    if not valid.any():
+        logging.warning("All samples in the batch have fully truncated labels; keeping the batch unchanged for PP stability.")
 
     fake_indices = [i for i, example in enumerate(examples) if example.get("_injected_fake")]
     if fake_indices:
