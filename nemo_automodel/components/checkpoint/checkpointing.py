@@ -518,8 +518,7 @@ class Checkpointer:
         compat_tied_lm_head_source_key: str | None = None
         lm_head_param_name = getattr(model_state, "lm_head_param_name", None)
         should_try_tied_lm_head_compat = (
-            not is_init_step
-            and getattr(model_state, "uses_tied_lm_head", False)
+            getattr(model_state, "uses_tied_lm_head", False)
             and not getattr(model_state, "has_local_tied_lm_head", False)
             and isinstance(lm_head_param_name, str)
             and lm_head_param_name in state_dict
@@ -534,8 +533,8 @@ class Checkpointer:
                     state_dict[source_name] = state_dict.pop(lm_head_param_name)
                     logging.warning(
                         "Checkpoint %s is missing %s. Loading tied source %s into lm_head "
-                        "for backward compatibility; this checkpoint was likely saved "
-                        "before the PP tied-lm-head fix.",
+                        "(HF tied-embedding checkpoints omit lm_head, and pre-fix DCP "
+                        "checkpoints with PP also omit it).",
                         model_path,
                         lm_head_param_name,
                         source_name,
