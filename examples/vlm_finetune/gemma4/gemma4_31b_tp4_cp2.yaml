@@ -24,9 +24,10 @@ recipe: FinetuneRecipeForVLM
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 500
-  val_every_steps: 500
-  num_epochs: 2
+  ckpt_every_steps: 100
+  val_every_steps: 100
+  max_steps: 200
+  num_epochs: 1
 
 dist_env:
   backend: nccl
@@ -39,7 +40,7 @@ rng:
 
 model:
   _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
-  pretrained_model_name_or_path: google/gemma-4-31B-it
+  pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-31B-it
   torch_dtype: torch.bfloat16
   use_liger_kernel: true
   use_sdpa_patching: false
@@ -68,9 +69,8 @@ loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
 dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
-  split: train[:1000]
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 2000
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
@@ -80,9 +80,8 @@ dataloader:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
 
 validation_dataset:
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
-  split: validation[:500]
+  _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
+  num_samples: 200
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
