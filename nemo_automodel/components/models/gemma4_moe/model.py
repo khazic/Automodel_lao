@@ -501,6 +501,30 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # Initialize the HF parent (creates self.model, self.lm_head, vision tower, etc.)
         super().__init__(config)
 
+        # Patch get_placeholder_mask to be TP-safe.
+        # When input_ids=None, HF calls get_input_embeddings() with a scalar
+        # token to find placeholder positions via embedding comparison.  Under
+        # TP the embedding has a RowwiseParallel output hook that tries Shard(1)
+        # on the 1-D output → IndexError.  We avoid this by returning all-False
+        # masks when input_ids is None: safe because in our dense/MoE forward we
+        # have already injected image features into inputs_embeds and pass
+        # pixel_values=None, so these masks are never actually consumed.
+        _orig_gpm = self.model.get_placeholder_mask
+
+        def _tp_safe_placeholder_mask(input_ids, inputs_embeds):
+            if input_ids is not None:
+                return _orig_gpm(input_ids, inputs_embeds)
+            batch, seq = inputs_embeds.shape[0], inputs_embeds.shape[1]
+            dev = (
+                inputs_embeds.to_local().device
+                if isinstance(inputs_embeds, DTensor)
+                else inputs_embeds.device
+            )
+            false_mask = torch.zeros((batch, seq), dtype=torch.bool, device=dev)
+            return false_mask, false_mask, false_mask
+
+        self.model.get_placeholder_mask = _tp_safe_placeholder_mask
+
         self.backend = backend
 
         text_config = config.text_config if hasattr(config, "text_config") else config
