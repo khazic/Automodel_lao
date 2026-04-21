@@ -567,13 +567,17 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 ).pooler_output
                 image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
 
-                if mm_token_type_ids is not None:
-                    special_image_mask = mm_token_type_ids == 1
-                elif input_ids is not None:
+                # input_ids is CP-sharded; mm_token_type_ids is not.
+                # Always derive the mask from input_ids when available so the
+                # seq dim matches the (potentially CP-sharded) inputs_embeds.
+                local_seq = inputs_embeds.shape[1]
+                if input_ids is not None:
                     special_image_mask = input_ids == self.config.image_token_id
+                elif mm_token_type_ids is not None:
+                    special_image_mask = (mm_token_type_ids == 1)[:, :local_seq]
                 else:
                     special_image_mask = torch.zeros(
-                        inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device
+                        (inputs_embeds.shape[0], local_seq), dtype=torch.bool, device=inputs_embeds.device
                     )
 
                 image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
