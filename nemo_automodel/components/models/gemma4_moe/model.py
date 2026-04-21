@@ -24,6 +24,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.shared.import_utils import UnavailableError, UnavailableMeta
 
@@ -580,8 +581,19 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                         (inputs_embeds.shape[0], local_seq), dtype=torch.bool, device=inputs_embeds.device
                     )
 
-                image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+                image_mask = special_image_mask.unsqueeze(-1).expand(
+                    inputs_embeds.shape[0], inputs_embeds.shape[1], inputs_embeds.shape[2]
+                ).to(inputs_embeds.device)
+                if isinstance(inputs_embeds, DTensor):
+                    local_ie = inputs_embeds.to_local()
+                    local_ie = local_ie.masked_scatter(
+                        image_mask.to(local_ie.device), image_features.to(local_ie.device, local_ie.dtype)
+                    )
+                    inputs_embeds = DTensor.from_local(
+                        local_ie, inputs_embeds.device_mesh, inputs_embeds.placements, run_check=False
+                    )
+                else:
+                    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
             return super().forward(
                 input_ids=None,
