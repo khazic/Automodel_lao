@@ -581,18 +581,45 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                         (inputs_embeds.shape[0], local_seq), dtype=torch.bool, device=inputs_embeds.device
                     )
 
-                image_mask = special_image_mask.unsqueeze(-1).expand(
-                    inputs_embeds.shape[0], inputs_embeds.shape[1], inputs_embeds.shape[2]
-                ).to(inputs_embeds.device)
                 if isinstance(inputs_embeds, DTensor):
+                    from torch.distributed.tensor import Shard as _Shard
+
                     local_ie = inputs_embeds.to_local()
-                    local_ie = local_ie.masked_scatter(
-                        image_mask.to(local_ie.device), image_features.to(local_ie.device, local_ie.dtype)
+                    local_seq = local_ie.shape[1]
+                    hidden = local_ie.shape[2]
+
+                    # For Shard(1) (sequence-parallel), each TP rank owns a
+                    # contiguous slice [seq_start : seq_start + local_seq].
+                    # DTensor.shape returns the global size, so we must derive
+                    # the offset from the mesh rank rather than from .shape[1].
+                    seq_start = 0
+                    for _mdim, _pl in enumerate(inputs_embeds.placements):
+                        if isinstance(_pl, _Shard) and _pl.dim == 1:
+                            seq_start = inputs_embeds.device_mesh.get_local_rank(_mdim) * local_seq
+                            break
+
+                    local_special_mask = special_image_mask[:, seq_start : seq_start + local_seq]
+                    local_image_mask = (
+                        local_special_mask.unsqueeze(-1).expand_as(local_ie).to(local_ie.device)
                     )
+
+                    # Extract only the image features that fall in this rank's token
+                    # slice.  image_features is a flat source for masked_scatter, so
+                    # we compute the prefix count of image tokens before seq_start,
+                    # then take the next local_img_count * hidden elements.
+                    prefix_img = int(special_image_mask[:, :seq_start].sum())
+                    local_img = int(local_special_mask.sum())
+                    flat_feats = image_features.to(local_ie.device, local_ie.dtype).reshape(-1)
+                    local_flat = flat_feats[prefix_img * hidden : (prefix_img + local_img) * hidden]
+
+                    local_ie = local_ie.masked_scatter(local_image_mask, local_flat)
                     inputs_embeds = DTensor.from_local(
                         local_ie, inputs_embeds.device_mesh, inputs_embeds.placements, run_check=False
                     )
                 else:
+                    image_mask = special_image_mask.unsqueeze(-1).expand(
+                        inputs_embeds.shape[0], inputs_embeds.shape[1], inputs_embeds.shape[2]
+                    ).to(inputs_embeds.device)
                     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
             return super().forward(
