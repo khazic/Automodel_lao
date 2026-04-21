@@ -221,32 +221,90 @@ def _parallelize_gemma4(
     """Parallelizes a Gemma4ForConditionalGeneration model across tensor parallel dimensions.
 
     Gemma4 VLM uses model.language_model.{embed_tokens, layers.*} for the text
-    backbone, identical to the Gemma3 VLM layout.
+    backbone, identical to the Gemma3 VLM layout.  Gemma4 additionally has
+
+      - four layernorms per decoder block (input / post_attention /
+        pre_feedforward / post_feedforward)
+      - optional per-layer-input projections on dense variants
+        (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm)
+
+    Both are handled by the SP plan below.
+
+    When ``sequence_parallel=True`` is set, activations between the sharded
+    Linear layers are kept as ``Shard(1)`` (sequence-sharded) DTensors, so
+    that LayerNorm/RMSNorm, residual adds, and embedding lookups run on
+    ``seq_len / tp_size`` tokens each rank instead of the full sequence.  This
+    is required for Gemma4 31B + CP at long context: without it the per-rank
+    activation memory scales with full ``S_local`` (from CP) rather than
+    ``S_local / tp_size``, which in practice causes OOMs on 80GB GPUs.
     """
-    if sequence_parallel:
-        import warnings
-
-        warnings.warn(
-            "sequence_parallel=True is not yet supported for Gemma4 and will be ignored. ",
-            stacklevel=2,
-        )
-
     model_prefix = "model.language_model"
 
-    return cast(
-        dict[str, ParallelStyle],
+    base_model_tp_plan: dict[str, ParallelStyle] = {
+        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
+        f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    # Gemma4 31B dense has an extra per-layer-input pathway: a gate projection
+    # from hidden_size to hidden_size_per_layer_input, a projection back, and
+    # a normalization on the result.  Shard the hidden axis of both Linears;
+    # they follow the same Colwise(gate) -> Rowwise(projection) pattern as
+    # gate_proj/down_proj in the MLP.  These keys are a no-op on the E4B /
+    # small-Gemma4 variants that do not have them.
+    base_model_tp_plan.update(
         {
-            f"{model_prefix}.embed_tokens": VocabParallelEmbedding(input_layouts=Replicate()),
-            f"{model_prefix}.layers.*.self_attn.q_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.self_attn.k_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.self_attn.v_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(),
-            f"{model_prefix}.layers.*.mlp.up_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.mlp.gate_proj": ColwiseParallel(),
-            f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(),
-            "lm_head": ColwiseParallel(output_layouts=Shard(-1), use_local_output=False),
-        },
+            f"{model_prefix}.layers.*.per_layer_input_gate": ColwiseParallel(),
+            f"{model_prefix}.layers.*.per_layer_projection": RowwiseParallel(),
+        }
     )
+
+    base_model_sp_plan: dict[str, ParallelStyle] = {
+        f"{model_prefix}.embed_tokens": VocabParallelEmbedding(
+            input_layouts=Replicate(),
+            output_layouts=Shard(1),
+            use_local_output=False,
+        ),
+        # Top-level final norm runs on sequence-sharded activations.
+        f"{model_prefix}.norm": SequenceParallel(),
+        # Each block's four RMSNorms keep the activation as Shard(1) throughout.
+        f"{model_prefix}.layers.*.input_layernorm": SequenceParallelAllGatherActivation(use_local_output=False),
+        f"{model_prefix}.layers.*.post_attention_layernorm": SequenceParallelAllGatherActivation(
+            use_local_output=False
+        ),
+        f"{model_prefix}.layers.*.pre_feedforward_layernorm": SequenceParallelAllGatherActivation(
+            use_local_output=False
+        ),
+        f"{model_prefix}.layers.*.post_feedforward_layernorm": SequenceParallel(),
+        # o_proj and down_proj emit Shard(1) so the residual add that follows
+        # stays sequence-sharded.
+        f"{model_prefix}.layers.*.self_attn.o_proj": RowwiseParallel(
+            output_layouts=Shard(1), use_local_output=False
+        ),
+        f"{model_prefix}.layers.*.mlp.down_proj": RowwiseParallel(
+            output_layouts=Shard(1), use_local_output=False
+        ),
+        # Per-layer-input pathway (31B dense only) — the output is fused back
+        # into the residual stream, so emit Shard(1) here as well.
+        f"{model_prefix}.layers.*.per_layer_projection": RowwiseParallel(
+            output_layouts=Shard(1), use_local_output=False
+        ),
+        f"{model_prefix}.layers.*.post_per_layer_input_norm": SequenceParallel(),
+        # lm_head consumes Shard(1) activations and produces vocab-sharded
+        # logits that loss_parallel consumes.
+        "lm_head": ColwiseParallel(input_layouts=Shard(1), output_layouts=Shard(-1), use_local_output=False),
+    }
+
+    if sequence_parallel:
+        base_model_tp_plan.update(cast(dict[str, ParallelStyle], base_model_sp_plan))
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
 def get_llama_nemotron_super_tp_plan(

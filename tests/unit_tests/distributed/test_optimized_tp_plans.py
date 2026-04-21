@@ -39,11 +39,14 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM, Qwen3ForS
 from nemo_automodel.components.distributed.optimized_tp_plans import (
     PARALLELIZE_FUNCTIONS,
     RotaryEmbedParallel,
+    VocabParallelEmbedding,
     _get_class_qualname,
     _parallelize_gemma3,
+    _parallelize_gemma4,
     _parallelize_llama,
     _parallelize_qwen,
 )
+from nemo_automodel.components.models.gemma4_moe.model import Gemma4ForConditionalGeneration
 
 
 class MockModel:
@@ -57,6 +60,7 @@ class MockModel:
             "qwen3_seq_cls": Qwen3ForSequenceClassification,
             "gemma3_causal": Gemma3ForCausalLM,
             "gemma3_conditional": Gemma3ForConditionalGeneration,
+            "gemma4_conditional": Gemma4ForConditionalGeneration,
         }[model_type]
 
 
@@ -266,6 +270,96 @@ class TestParallelizeFunctions:
         assert isinstance(result["model.embed_tokens"], RowwiseParallel)
         assert isinstance(result["model.rotary_emb"], RotaryEmbedParallel)
         assert isinstance(result["model.layers.*.input_layernorm"], SequenceParallel)
+
+    def test_parallelize_gemma4_conditional_basic(self):
+        """Test _parallelize_gemma4 without sequence parallelism."""
+        model = MockModel("gemma4_conditional")
+
+        result = _parallelize_gemma4(model, sequence_parallel=False)
+
+        assert isinstance(result, dict)
+
+        # Gemma4 VLM uses the language_model prefix for the text backbone.
+        expected_patterns = [
+            "model.language_model.embed_tokens",
+            "model.language_model.layers.*.self_attn.q_proj",
+            "model.language_model.layers.*.self_attn.k_proj",
+            "model.language_model.layers.*.self_attn.v_proj",
+            "model.language_model.layers.*.self_attn.o_proj",
+            "model.language_model.layers.*.mlp.up_proj",
+            "model.language_model.layers.*.mlp.gate_proj",
+            "model.language_model.layers.*.mlp.down_proj",
+            # Gemma4 31B per-layer-input pathway — present in the TP plan even
+            # for smaller variants (no-op on checkpoints without these modules).
+            "model.language_model.layers.*.per_layer_input_gate",
+            "model.language_model.layers.*.per_layer_projection",
+            "lm_head",
+        ]
+        for pattern in expected_patterns:
+            assert pattern in result
+
+        assert isinstance(
+            result["model.language_model.layers.*.self_attn.q_proj"], ColwiseParallel
+        )
+        assert isinstance(
+            result["model.language_model.layers.*.self_attn.o_proj"], RowwiseParallel
+        )
+        assert isinstance(
+            result["model.language_model.layers.*.per_layer_input_gate"], ColwiseParallel
+        )
+        assert isinstance(
+            result["model.language_model.layers.*.per_layer_projection"], RowwiseParallel
+        )
+
+    def test_parallelize_gemma4_with_sequence_parallel(self):
+        """Test _parallelize_gemma4 with sequence parallelism enabled.
+
+        Verifies the full SP plan covers all four Gemma4 layernorms plus the
+        31B per-layer-input normalization, the sequence-sharded residual emit
+        layouts on o_proj / down_proj / per_layer_projection, and the
+        VocabParallelEmbedding sequence-shard output.
+        """
+        model = MockModel("gemma4_conditional")
+
+        result = _parallelize_gemma4(model, sequence_parallel=True)
+
+        # All four per-block layernorms should be sequence-parallelized.
+        sp_layernorm_patterns = [
+            "model.language_model.layers.*.input_layernorm",
+            "model.language_model.layers.*.post_attention_layernorm",
+            "model.language_model.layers.*.pre_feedforward_layernorm",
+            "model.language_model.layers.*.post_feedforward_layernorm",
+            # Gemma4 31B per-layer-input norm.
+            "model.language_model.layers.*.post_per_layer_input_norm",
+            # Top-level final norm.
+            "model.language_model.norm",
+        ]
+        for pattern in sp_layernorm_patterns:
+            assert pattern in result
+            assert isinstance(result[pattern], SequenceParallel)
+
+        # Residual-emitting projections must output Shard(1) so the residual
+        # stream stays sequence-sharded between blocks.
+        for pattern in (
+            "model.language_model.layers.*.self_attn.o_proj",
+            "model.language_model.layers.*.mlp.down_proj",
+            "model.language_model.layers.*.per_layer_projection",
+        ):
+            style = result[pattern]
+            assert isinstance(style, RowwiseParallel)
+
+        # VocabParallelEmbedding should emit Shard(1) to feed the SP layernorms.
+        embed = result["model.language_model.embed_tokens"]
+        assert isinstance(embed, VocabParallelEmbedding)
+
+        # lm_head consumes sequence-sharded activations under SP.
+        assert isinstance(result["lm_head"], ColwiseParallel)
+
+    def test_parallelize_gemma4_registered_in_parallelize_functions(self):
+        """Gemma4ForConditionalGeneration must be wired into the dispatch map."""
+        key = _get_class_qualname(Gemma4ForConditionalGeneration)
+        assert key in PARALLELIZE_FUNCTIONS
+        assert PARALLELIZE_FUNCTIONS[key] is _parallelize_gemma4
 
     def test_parallelize_llama_basic(self):
         """Test _parallelize_llama without sequence parallelism."""
