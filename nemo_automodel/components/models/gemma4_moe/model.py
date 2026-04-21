@@ -555,15 +555,38 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
 
         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
         if not getattr(text_config, "enable_moe_block", False):
-            # Dense path — delegate to HF forward
+            # Dense path: handle embedding + image injection ourselves to avoid
+            # HF's boolean-index on DTensor (inputs_embeds[image_mask]) which
+            # fails under TP where inputs_embeds is a DTensor.
+            if input_ids is not None and inputs_embeds is None:
+                inputs_embeds = self.model.get_input_embeddings()(input_ids)
+
+            if pixel_values is not None:
+                image_features = self.model.get_image_features(
+                    pixel_values, image_position_ids=image_position_ids, return_dict=True
+                ).pooler_output
+                image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
+
+                if mm_token_type_ids is not None:
+                    special_image_mask = mm_token_type_ids == 1
+                elif input_ids is not None:
+                    special_image_mask = input_ids == self.config.image_token_id
+                else:
+                    special_image_mask = torch.zeros(
+                        inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device
+                    )
+
+                image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
+
             return super().forward(
-                input_ids=input_ids,
+                input_ids=None,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
-                pixel_values=pixel_values,
-                image_position_ids=image_position_ids,
+                pixel_values=None,
+                image_position_ids=None,
                 mm_token_type_ids=mm_token_type_ids,
                 **kwargs,
             )
