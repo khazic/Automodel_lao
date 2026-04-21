@@ -71,26 +71,24 @@ loss_fn:
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
   num_samples: 2000
+  num_images_per_sample: 0
   max_length: 8192
 
 dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
   num_workers: 0
   pin_memory: true
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
-    max_length: 8192
+  drop_last: true
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.mock.build_mock_vlm_dataset
   num_samples: 200
+  num_images_per_sample: 0
   max_length: 8192
 
 validation_dataloader:
   _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.gemma4_prefix_collate_fn
-    max_length: 8192
+  drop_last: true
 
 optimizer:
   _target_: torch.optim.AdamW
