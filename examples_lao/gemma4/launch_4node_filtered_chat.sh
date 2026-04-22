@@ -1,0 +1,13 @@
+#!/bin/bash
+# Usage: bash examples_lao/gemma4/launch_4node_filtered_chat.sh <node_rank>
+# Example on master node: bash examples_lao/gemma4/launch_4node_filtered_chat.sh 0
+set -euo pipefail
+NODE_RANK=${1:?'Usage: bash launch_4node_filtered_chat.sh <node_rank 0-3>'}
+MASTER_ADDR=10.178.157.101
+MASTER_PORT=29500
+REPO_ROOT=/llm-align/liuchonghan/Automodel_lao
+CONFIG=examples_lao/gemma4/gemma4_31b_sft_4node_tp4_filtered_chat.yaml
+export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH:-}
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+cd ${REPO_ROOT}
+torchrun --nproc-per-node=8 --nnodes=4 --node_rank=${NODE_RANK} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} -m nemo_automodel.cli.app ${CONFIG}
