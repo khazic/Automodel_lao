@@ -68,6 +68,7 @@ dataset:
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dayuzhong_instruct_gemini3.1_5w.parquet
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dyz_trans_10w_gemini3.1.parquet
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/filtered_chat.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/trans_terms_for_train_data.parquet
   split: train
   shuffle_seed: 42
 
