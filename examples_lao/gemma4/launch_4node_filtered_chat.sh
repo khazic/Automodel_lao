@@ -19,4 +19,4 @@ export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
 echo "Using network interface: ${IFACE}"
 
 cd ${REPO_ROOT}
-torchrun --nproc-per-node=8 --nnodes=4 --node_rank=${NODE_RANK} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} -m nemo_automodel.cli.app ${CONFIG}
+torchrun --nproc-per-node=8 --nnodes=4 --node_rank=${NODE_RANK} --rdzv-backend=c10d --rdzv-endpoint=${MASTER_ADDR}:${MASTER_PORT} --rdzv-id=gemma4-sft-filtered-chat -m nemo_automodel.cli.app ${CONFIG}
