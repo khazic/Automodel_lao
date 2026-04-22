@@ -9,5 +9,14 @@ REPO_ROOT=/llm-align/liuchonghan/Automodel_lao
 CONFIG=examples_lao/gemma4/gemma4_31b_sft_4node_tp4_filtered_chat.yaml
 export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# Force IPv4 — k8s clusters often try IPv6 first (errno 97) when resolving hostnames
+IFACE=$(ip -4 route get ${MASTER_ADDR} 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+IFACE=${IFACE:-eth0}
+export NCCL_SOCKET_IFNAME=${IFACE}
+export GLOO_SOCKET_IFNAME=${IFACE}
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+echo "Using network interface: ${IFACE}"
+
 cd ${REPO_ROOT}
 torchrun --nproc-per-node=8 --nnodes=4 --node_rank=${NODE_RANK} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} -m nemo_automodel.cli.app ${CONFIG}
