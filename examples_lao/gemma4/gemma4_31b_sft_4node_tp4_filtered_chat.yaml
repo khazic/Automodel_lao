@@ -26,8 +26,8 @@
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 8
-  local_batch_size: 1
+  global_batch_size: 32
+  local_batch_size: 4
   ckpt_every_steps: 500
   val_every_steps: null
   num_epochs: 1
@@ -81,7 +81,6 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:gemma4_prefix_truncating_collate_fn
-    max_length: 1024
 
 optimizer:
   _target_: torch.optim.AdamW
