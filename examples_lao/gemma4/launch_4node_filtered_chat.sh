@@ -14,7 +14,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 IFACE=$(ip -4 route get ${MASTER_ADDR} 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1 || true)
 IFACE=${IFACE:-eth0}
 export GLOO_SOCKET_IFNAME=${IFACE}
-# Let NCCL use platform defaults (IB/mlx5/GDR configured by cluster)
+# Force TCP (disable IB) — platform mlx5/GDR config causes SIGABRT on some nodes
+export NCCL_IB_DISABLE=1
+export NCCL_NET_GDR_READ=0
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 echo "Using gloo interface: ${IFACE}"
 
