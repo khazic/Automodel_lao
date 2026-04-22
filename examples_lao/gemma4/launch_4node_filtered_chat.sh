@@ -15,7 +15,9 @@ IFACE=$(ip -4 route get ${MASTER_ADDR} 2>/dev/null | awk '{for(i=1;i<=NF;i++) if
 IFACE=${IFACE:-eth0}
 export NCCL_SOCKET_IFNAME=${IFACE}
 export GLOO_SOCKET_IFNAME=${IFACE}
-export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-1}
+export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
 echo "Using network interface: ${IFACE}"
 
 cd ${REPO_ROOT}
