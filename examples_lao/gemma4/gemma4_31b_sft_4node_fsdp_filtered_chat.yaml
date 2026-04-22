@@ -17,13 +17,13 @@
 #
 # Hardware: 4 nodes x 8 x A800-80G = 32 GPUs
 # Parallelism: tp=1, dp=32 (FSDP2)
-# Effective batch: gbs=32, lbs=1, grad_accum=1
+# Effective batch: gbs=256, lbs=8, grad_accum=1
 
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 128
-  local_batch_size: 4
+  global_batch_size: 256
+  local_batch_size: 8
   ckpt_every_steps: 500
   val_every_steps: null
   num_epochs: 1
