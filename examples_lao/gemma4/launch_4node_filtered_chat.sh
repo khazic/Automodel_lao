@@ -11,7 +11,7 @@ export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH:-}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Force IPv4 — k8s clusters often try IPv6 first (errno 97) when resolving hostnames
-IFACE=$(ip -4 route get ${MASTER_ADDR} 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+IFACE=$(ip -4 route get ${MASTER_ADDR} 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1 || true)
 IFACE=${IFACE:-eth0}
 export NCCL_SOCKET_IFNAME=${IFACE}
 export GLOO_SOCKET_IFNAME=${IFACE}
