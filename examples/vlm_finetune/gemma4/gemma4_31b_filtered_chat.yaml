@@ -46,6 +46,9 @@ model:
   text_config:
     use_cache: false
 
+processor:
+  padding_side: right
+
 checkpoint:
   enabled: true
   checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_filtered_chat/
