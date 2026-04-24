@@ -108,11 +108,14 @@ class DeepseekV4Block(nn.Module):
         self.hc_mult = config.hc_mult
         self.hc_eps = config.hc_eps
 
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
         self.self_attn = DeepseekV4Attention(config, backend)
         self.mlp = MoE(moe_config, backend)
-        self.input_layernorm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = initialize_rms_norm_module(
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
+        )
         self.post_attention_layernorm = initialize_rms_norm_module(
-            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
+            backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps, dtype=model_dtype
         )
 
         # HC parameters — present in ALL layers, stored as float32.
@@ -262,7 +265,12 @@ class DeepseekV4Model(nn.Module):
         for layer_id in range(config.num_hidden_layers):
             self.layers[str(layer_id)] = DeepseekV4Block(layer_id, config, self.moe_config, backend)
 
-        self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = initialize_rms_norm_module(
+            backend.rms_norm,
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+        )
 
         self.max_seq_len = config.max_position_embeddings
         self.register_buffer(
@@ -387,7 +395,13 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
             moe_config=moe_config,
             moe_overrides=moe_overrides,
         )
-        self.lm_head = initialize_linear_module(self.backend.linear, config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = initialize_linear_module(
+            self.backend.linear,
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
+        )
         if self.backend.enable_hf_state_dict_adapter:
             self.state_dict_adapter = DeepSeekV4StateDictAdapter(
                 self.config,

@@ -72,6 +72,7 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
     yarn_get_mscale,
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
+from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 # ---------------------------------------------------------------------------
 # Grouped output projection (wo_a)
@@ -100,6 +101,7 @@ class GroupedOutputProjection(nn.Module):
         head_dim: int,
         o_lora_rank: int,
         n_groups: int,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         super().__init__()
         assert n_heads % n_groups == 0
@@ -109,7 +111,7 @@ class GroupedOutputProjection(nn.Module):
         self.o_lora_rank = o_lora_rank
         in_per_group = self.n_heads_per_group * head_dim  # 8 * 512 = 4096
         out_total = n_groups * o_lora_rank  # 8 * 1024 = 8192
-        self.weight = nn.Parameter(torch.zeros(out_total, in_per_group))
+        self.weight = nn.Parameter(torch.zeros(out_total, in_per_group, dtype=dtype))
 
     def forward(self, o: torch.Tensor) -> torch.Tensor:
         # o: [..., n_heads, head_dim]
@@ -201,15 +203,22 @@ class DeepseekV4Attention(nn.Module):
         linear_impl = backend.linear
         rms_norm_impl = backend.rms_norm
         hidden_size = config.hidden_size
+        model_dtype = get_dtype(config.torch_dtype, torch.bfloat16)
 
         # Q LoRA
-        self.wq_a = initialize_linear_module(linear_impl, hidden_size, self.q_lora_rank, bias=False)
-        self.q_norm = initialize_rms_norm_module(rms_norm_impl, self.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = initialize_linear_module(linear_impl, self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
+        self.wq_a = initialize_linear_module(linear_impl, hidden_size, self.q_lora_rank, bias=False, dtype=model_dtype)
+        self.q_norm = initialize_rms_norm_module(
+            rms_norm_impl, self.q_lora_rank, eps=config.rms_norm_eps, dtype=model_dtype
+        )
+        self.wq_b = initialize_linear_module(
+            linear_impl, self.q_lora_rank, self.n_heads * self.head_dim, bias=False, dtype=model_dtype
+        )
 
         # Combined KV projection: K = V = wkv(x), single latent of dim head_dim
-        self.wkv = initialize_linear_module(linear_impl, hidden_size, self.head_dim, bias=False)
-        self.kv_norm = initialize_rms_norm_module(rms_norm_impl, self.head_dim, eps=config.rms_norm_eps)
+        self.wkv = initialize_linear_module(linear_impl, hidden_size, self.head_dim, bias=False, dtype=model_dtype)
+        self.kv_norm = initialize_rms_norm_module(
+            rms_norm_impl, self.head_dim, eps=config.rms_norm_eps, dtype=model_dtype
+        )
 
         # Grouped output projection
         self.wo_a = GroupedOutputProjection(
@@ -217,8 +226,11 @@ class DeepseekV4Attention(nn.Module):
             head_dim=self.head_dim,
             o_lora_rank=self.o_lora_rank,
             n_groups=self.o_groups,
+            dtype=model_dtype,
         )
-        self.wo_b = initialize_linear_module(linear_impl, self.o_groups * self.o_lora_rank, hidden_size, bias=False)
+        self.wo_b = initialize_linear_module(
+            linear_impl, self.o_groups * self.o_lora_rank, hidden_size, bias=False, dtype=model_dtype
+        )
 
         # Attention sink: per-head learnable scalar (stored in float32 per official impl)
         # Shape: [n_heads] — broadcast over the sink position in sparse_attn.
