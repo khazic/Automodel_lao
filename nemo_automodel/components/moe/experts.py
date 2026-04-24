@@ -624,6 +624,11 @@ class GroupedExpertsDeepEP(nn.Module):
 
         self.expert_activation = get_expert_activation_for_deepep(config)
 
+        # Set defaults; overwritten by init_token_dispatcher when EP is active.
+        self.n_routed_experts = config.n_routed_experts
+        self.ep_size = 1
+        self.ep_rank = 0
+
     def init_token_dispatcher(self, ep_mesh: DeviceMesh):
         self.ep_size = ep_mesh.size()
         self.ep_rank = ep_mesh.get_local_rank()

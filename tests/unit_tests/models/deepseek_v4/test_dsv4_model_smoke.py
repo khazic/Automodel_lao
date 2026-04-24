@@ -79,6 +79,8 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
         rms_norm="torch",
         rope_fusion=False,
         enable_hf_state_dict_adapter=False,
+        dispatcher="torch",
+        experts="torch_mm",
     )
     model = DeepseekV4ForCausalLM(config, backend=backend)
     model.eval()
