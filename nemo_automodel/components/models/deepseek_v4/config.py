@@ -74,6 +74,10 @@ class DeepseekV4Config(PretrainedConfig):
         hc_eps: float = 1e-6,
         hc_mult: int = 4,
         hc_sinkhorn_iters: int = 20,
+        # Compressor/Indexer for compress-ratio attention layers (not yet implemented)
+        index_head_dim: int = 128,
+        index_n_heads: int = 64,
+        index_topk: int = 512,
         # Multi-token prediction layers appended after the main layers
         num_nextn_predict_layers: int = 1,
         # Standard options
@@ -120,6 +124,9 @@ class DeepseekV4Config(PretrainedConfig):
         self.hc_eps = hc_eps
         self.hc_mult = hc_mult
         self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.index_head_dim = index_head_dim
+        self.index_n_heads = index_n_heads
+        self.index_topk = index_topk
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.rms_norm_eps = rms_norm_eps
         self.attention_bias = attention_bias

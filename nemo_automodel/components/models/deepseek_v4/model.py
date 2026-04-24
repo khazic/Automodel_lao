@@ -49,7 +49,6 @@ import torch.nn as nn
 
 from nemo_automodel.components.models.common import (
     BackendConfig,
-    get_rope_config,
     initialize_linear_module,
     initialize_rms_norm_module,
 )
@@ -265,14 +264,13 @@ class DeepseekV4Model(nn.Module):
         self.norm = initialize_rms_norm_module(backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps)
 
         self.max_seq_len = config.max_position_embeddings
-        rope_theta, rope_scaling, _ = get_rope_config(config)
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
                 config.qk_rope_head_dim,
                 self.max_seq_len,
-                rope_theta,
-                rope_scaling,
+                config.rope_theta,
+                config.rope_scaling,
             ),
             persistent=False,
         )
@@ -334,12 +332,11 @@ class DeepseekV4Model(nn.Module):
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or torch.device(f"cuda:{torch.cuda.current_device()}")
         with buffer_device:
-            rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.max_seq_len,
-                rope_theta,
-                rope_scaling,
+                self.config.rope_theta,
+                self.config.rope_scaling,
             ).to(buffer_device)
             if self.embed_tokens is not None:
                 nn.init.normal_(self.embed_tokens.weight)
@@ -459,12 +456,11 @@ class DeepseekV4ForCausalLM(HFCheckpointingMixin, nn.Module, MoEFSDPSyncMixin):
                 )
         cast_model_to_dtype(self, dtype)
         with buffer_device:
-            rope_theta, rope_scaling, _ = get_rope_config(self.config)
             self.model.freqs_cis = precompute_freqs_cis(
                 self.config.qk_rope_head_dim,
                 self.model.max_seq_len,
-                rope_theta,
-                rope_scaling,
+                self.config.rope_theta,
+                self.config.rope_scaling,
             )
 
 
