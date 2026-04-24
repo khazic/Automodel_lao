@@ -14,15 +14,30 @@
 
 """DeepSeek V4 Model.
 
-All transformer blocks use MoE FFN (no first_k_dense_replace dense layers).
-The first num_hash_layers blocks register learnable HC (hash-clustering)
-parameters (hc_attn_base, hc_attn_fn, hc_attn_scale, hc_ffn_base,
-hc_ffn_fn, hc_ffn_scale) for checkpoint compatibility.  The actual HC
-attention routing is not yet implemented; those layers fall back to
-standard causal attention.
+Key architectural points (from official inference/model.py):
 
-Compress-ratio based sliding-window attention is also not yet implemented;
-all layers use full causal attention regardless of compress_ratios.
+HC (Hyper-Connections):
+  Every transformer block maintains hc_mult=4 copies of the hidden state.
+  The embedding output is expanded: [B,S,dim] -> [B,S,hc_mult,dim].
+  hc_pre  reduces [B,S,hc_mult,dim] -> [B,S,dim] before attn/ffn.
+  hc_post expands [B,S,dim] -> [B,S,hc_mult,dim] after attn/ffn.
+  Full HC requires the hc_split_sinkhorn CUDA kernel.
+  Current fallback: mean-pooling for hc_pre, broadcast add for hc_post.
+
+HC parameters (ALL layers, stored in float32):
+  hc_attn_fn    : [mix_hc, hc_mult*dim]  where mix_hc = (2+hc_mult)*hc_mult = 24
+  hc_attn_base  : [mix_hc]
+  hc_attn_scale : [3]
+  hc_ffn_fn     : [mix_hc, hc_mult*dim]
+  hc_ffn_base   : [mix_hc]
+  hc_ffn_scale  : [3]
+
+Gate hash layers (layer_idx < num_hash_layers):
+  Instead of score-based routing, the gate uses a fixed token-id -> expert-id
+  lookup table (tid2eid: [vocab_size, n_activated_experts]).
+
+All layers use MoE FFN (no dense layers).
+Compress-ratio sliding-window attention is not yet implemented.
 """
 
 from __future__ import annotations
@@ -42,7 +57,11 @@ from nemo_automodel.components.models.common.hf_checkpointing_mixin import HFChe
 from nemo_automodel.components.models.common.utils import cast_model_to_dtype
 from nemo_automodel.components.models.deepseek_v3.rope_utils import freqs_cis_from_position_ids, precompute_freqs_cis
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
-from nemo_automodel.components.models.deepseek_v4.layers import DeepseekV4Attention
+from nemo_automodel.components.models.deepseek_v4.layers import (
+    DeepseekV4Attention,
+    hc_post_approx,
+    hc_pre_approx,
+)
 from nemo_automodel.components.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.fsdp_mixin import MoEFSDPSyncMixin
@@ -50,18 +69,32 @@ from nemo_automodel.components.moe.layers import MoE
 from nemo_automodel.components.utils.model_utils import squeeze_input_for_thd
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
-# Placeholder shape for HC (hash-clustering) parameter tensors.
-# The exact shapes depend on the HC implementation details.
-# Store as 1D scalars for now; replace with proper shapes when HC is implemented.
-_HC_PARAM_SHAPE = (1,)
+
+def _hc_param_shape(hc_mult: int, dim: int) -> dict[str, tuple[int, ...]]:
+    """Return the HC parameter shapes for a single block."""
+    mix_hc = (2 + hc_mult) * hc_mult  # (2+4)*4 = 24
+    hc_dim = hc_mult * dim  # 4 * 4096 = 16384
+    return {
+        "hc_attn_fn": (mix_hc, hc_dim),
+        "hc_attn_base": (mix_hc,),
+        "hc_attn_scale": (3,),
+        "hc_ffn_fn": (mix_hc, hc_dim),
+        "hc_ffn_base": (mix_hc,),
+        "hc_ffn_scale": (3,),
+    }
 
 
 class DeepseekV4Block(nn.Module):
     """Single transformer block for DeepSeek V4.
 
-    All layers use MoE for the FFN.  Hash-clustering attention layers
-    (layer_idx < num_hash_layers) additionally register HC parameters
-    so that their HF checkpoints can be loaded correctly.
+    All layers:
+    - Carry HC parameters (stored in float32 per official impl).
+    - Use MoE FFN.
+
+    HC computation (hc_pre / hc_post) currently falls back to an approximation
+    (mean-pool / broadcast-add) because the hc_split_sinkhorn kernel is not
+    available.  The HC parameters are still registered so that HF checkpoints
+    load without error.
     """
 
     def __init__(
@@ -73,7 +106,8 @@ class DeepseekV4Block(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
-        self.is_hash_layer = layer_idx < config.num_hash_layers
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
 
         self.self_attn = DeepseekV4Attention(config, backend)
         self.mlp = MoE(moe_config, backend)
@@ -82,11 +116,10 @@ class DeepseekV4Block(nn.Module):
             backend.rms_norm, config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # HC parameters: present only on hash-clustering layers.
-        # These are checkpoint-compatibility stubs; HC routing is not yet implemented.
-        if self.is_hash_layer:
-            for name in ("hc_attn_base", "hc_attn_fn", "hc_attn_scale", "hc_ffn_base", "hc_ffn_fn", "hc_ffn_scale"):
-                self.register_parameter(name, nn.Parameter(torch.zeros(_HC_PARAM_SHAPE)))
+        # HC parameters — present in ALL layers, stored as float32.
+        shapes = _hc_param_shape(config.hc_mult, config.hidden_size)
+        for name, shape in shapes.items():
+            self.register_parameter(name, nn.Parameter(torch.zeros(shape, dtype=torch.float32)))
 
     def forward(
         self,
@@ -96,17 +129,27 @@ class DeepseekV4Block(nn.Module):
         padding_mask: torch.Tensor | None = None,
         **attn_kwargs: Any,
     ) -> torch.Tensor:
+        # x: [bsz, seq, hc_mult, dim] (HC multi-copy state)
         if attention_mask is not None and padding_mask is None:
             padding_mask = attention_mask.bool().logical_not()
 
+        # Attention sub-block
+        residual = x
+        x_reduced, post, comb = hc_pre_approx(x, eps=self.hc_eps)
         attn_out = self.self_attn(
-            x=self.input_layernorm(x),
+            x=self.input_layernorm(x_reduced),
             freqs_cis=freqs_cis,
             attention_mask=attention_mask,
             **attn_kwargs,
         )
-        x = x + attn_out
-        x = x + self.mlp(self.post_attention_layernorm(x), padding_mask)
+        x = hc_post_approx(attn_out, residual, post, comb)
+
+        # FFN sub-block
+        residual = x
+        x_reduced, post, comb = hc_pre_approx(x, eps=self.hc_eps)
+        ffn_out = self.mlp(self.post_attention_layernorm(x_reduced), padding_mask)
+        x = hc_post_approx(ffn_out, residual, post, comb)
+
         return x
 
     def init_weights(self, buffer_device: torch.device) -> None:
@@ -114,6 +157,65 @@ class DeepseekV4Block(nn.Module):
         self.post_attention_layernorm.reset_parameters()
         self.self_attn.init_weights(buffer_device)
         self.mlp.init_weights(buffer_device)
+        # HC params: leave as zeros (matches official random init at first step)
+
+
+class DeepseekV4HashGate(nn.Module):
+    """Hash gate for first num_hash_layers: routes tokens via a fixed lookup table.
+
+    Instead of computing routing scores, the gate uses tid2eid[token_id] to
+    pre-assign expert indices.  The routing weight is still computed from the
+    gate weight but the *selection* is deterministic per token id.
+
+    tid2eid shape: [vocab_size, n_activated_experts]  (int32, non-trainable)
+    """
+
+    def __init__(self, config: DeepseekV4Config, moe_config: MoEConfig):
+        super().__init__()
+        self.topk = moe_config.n_activated_experts
+        self.n_experts = moe_config.n_routed_experts
+        self.score_func = moe_config.score_func
+        self.route_scale = moe_config.route_scale
+        self.norm_topk_prob = moe_config.norm_topk_prob
+
+        # Routing score weight (used to compute weights, not for selection)
+        self.weight = nn.Parameter(torch.zeros(self.n_experts, config.hidden_size))
+        # Token-id -> expert-id lookup table (non-trainable)
+        self.register_parameter(
+            "tid2eid",
+            nn.Parameter(
+                torch.zeros(config.vocab_size, self.topk, dtype=torch.int32),
+                requires_grad=False,
+            ),
+        )
+        # No correction bias for hash layers (per official impl)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import torch.nn.functional as F
+
+        scores = F.linear(x.float(), self.weight.float())
+        if self.score_func == "sqrtsoftplus":
+            scores = F.softplus(scores).sqrt()
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:
+            scores = scores.softmax(dim=-1)
+
+        if input_ids is not None:
+            indices = self.tid2eid[input_ids.flatten()]
+        else:
+            indices = scores.topk(self.topk, dim=-1)[1]
+
+        weights = scores.gather(1, indices.long())
+        if self.score_func != "softmax":
+            denom = weights.sum(dim=-1, keepdim=True) + 1e-20
+            weights = weights / denom
+        weights = weights * self.route_scale
+        return weights.type_as(x), indices
 
 
 class DeepseekV4Model(nn.Module):
@@ -139,7 +241,7 @@ class DeepseekV4Model(nn.Module):
             n_routed_experts=config.n_routed_experts,
             n_shared_experts=config.n_shared_experts,
             n_activated_experts=config.num_experts_per_tok,
-            # V4 has no group-limited routing (topk_method=noaux_tc with no n_group/topk_group)
+            # V4 has no group-limited routing (noaux_tc with no n_group/topk_group)
             n_expert_groups=0,
             n_limited_groups=0,
             train_gate=True,
@@ -206,7 +308,9 @@ class DeepseekV4Model(nn.Module):
                 cp_size=attn_kwargs.get("cp_size", 1),
             )
 
-        h = inputs_embeds
+        # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
+        h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
+
         for layer in self.layers.values():
             h = layer(
                 x=h,
@@ -216,7 +320,9 @@ class DeepseekV4Model(nn.Module):
                 **attn_kwargs,
             )
 
-        return self.norm(h) if self.norm else h
+        # Reduce hc_mult copies -> [B,S,dim] for the final norm + lm_head
+        h_reduced = h.mean(dim=2)
+        return self.norm(h_reduced) if self.norm else h_reduced
 
     def update_moe_gate_bias(self) -> None:
         with torch.no_grad():

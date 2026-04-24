@@ -14,21 +14,40 @@
 
 """DeepSeek V4 Attention Layer.
 
-V4 replaces MLA (Multi-head Latent Attention) with GQA + Q/O LoRA:
-  - Q  : hidden -> wq_a -> q_norm -> wq_b -> [n_heads, head_dim]
-  - KV : hidden -> wkv -> split -> kv_norm(K), V unchanged
-  - RoPE applied to the last qk_rope_head_dim dimensions of Q and K.
-  - Attention: standard GQA with num_key_value_heads=1 (MQA).
-  - O  : flat_output -> wo_a (block-diagonal grouped) -> wo_b -> hidden
+Architecture (from official inference/model.py):
 
-The first num_hash_layers use hash-clustering (HC) attention for dynamic
-token grouping. This is currently a stub; HC is replaced by full causal
-attention and the HC parameters (hc_attn_base/fn/scale) are stored for
-checkpoint compatibility only.
+Q path:
+  x  -> wq_a [hidden -> q_lora_rank]
+     -> q_norm (RMSNorm)
+     -> wq_b  [q_lora_rank -> n_heads * head_dim]
+     -> reshape [n_heads, head_dim]
+     -> per-head RMSNorm  (q_norm applied per-head in official code)
+     -> apply_rotary_emb on last rope_head_dim dims
 
-Layers with compress_ratios[i] > 0 are intended to use a compressed /
-sliding-window KV, with an attention sink token prepended. The sliding-
-window masking is not yet implemented; all layers use full causal attention.
+KV path (K = V, single latent):
+  x  -> wkv   [hidden -> head_dim]        # single KV head, K = V = kv
+     -> kv_norm (RMSNorm on head_dim)
+     -> apply_rotary_emb on last rope_head_dim dims
+  K = V = kv  (one latent vector serves both key and value)
+
+Output path (grouped):
+  o [bsz, seq, n_heads, head_dim]
+    -> reshape [bsz, seq, n_groups, n_heads_per_group * head_dim]
+    -> wo_a einsum per group: [n_heads_per_group * head_dim] -> [o_lora_rank]
+    -> reshape [bsz, seq, n_groups * o_lora_rank]
+    -> wo_b [n_groups * o_lora_rank -> hidden]
+
+attn_sink: learnable per-head scalar bias added to attention-sink position score.
+
+HC (Hyper-Connections):
+  Each Block maintains hc_mult=4 copies of the hidden state.
+  hc_pre  reduces [bsz, seq, hc_mult, dim] -> [bsz, seq, dim] via Sinkhorn mixing.
+  hc_post expands [bsz, seq, dim] -> [bsz, seq, hc_mult, dim].
+  The hc_split_sinkhorn kernel is not yet implemented; hc_pre falls back to a
+  mean-pooling approximation and hc_post falls back to broadcasting.
+
+Sliding-window / compress-ratio attention is NOT yet implemented.
+All layers use full causal attention regardless of compress_ratios.
 """
 
 from __future__ import annotations
@@ -54,59 +73,122 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
 )
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 
+# ---------------------------------------------------------------------------
+# Grouped output projection (wo_a)
+# ---------------------------------------------------------------------------
 
-class GroupedLinear(nn.Module):
-    """Block-diagonal grouped linear projection.
 
-    Splits in_features into `groups` equal groups, projects each group
-    independently with weight [out_features//groups, in_features//groups],
-    then concatenates the results. The full weight is stored as a single
-    [out_features, in_features] parameter with a block-diagonal structure
-    so that it is compatible with HuggingFace checkpoint shapes.
+class GroupedOutputProjection(nn.Module):
+    """Block-diagonal output projection for DeepSeek V4.
+
+    Splits the n_heads attention outputs into n_groups groups, projects each
+    group's n_heads_per_group * head_dim dimensions to o_lora_rank, then
+    concatenates.
+
+    Weight shape: [n_groups * o_lora_rank, n_heads_per_group * head_dim]
+                = [8 * 1024, 8 * 512] = [8192, 4096]
+
+    This matches the official model.py:
+        wo_a = Linear(n_heads * head_dim // n_groups, n_groups * o_lora_rank)
+        wo_a = wo_a.weight.view(n_groups, o_lora_rank, -1)
+        o = einsum("bsgd,grd->bsgr", o_grouped, wo_a)
     """
 
-    def __init__(self, in_features: int, out_features: int, groups: int):
+    def __init__(
+        self,
+        n_heads: int,
+        head_dim: int,
+        o_lora_rank: int,
+        n_groups: int,
+    ):
         super().__init__()
-        assert in_features % groups == 0, f"in_features {in_features} not divisible by groups {groups}"
-        assert out_features % groups == 0, f"out_features {out_features} not divisible by groups {groups}"
-        self.groups = groups
-        self.in_per_group = in_features // groups
-        self.out_per_group = out_features // groups
-        self.weight = nn.Parameter(torch.zeros(out_features, in_features))
+        assert n_heads % n_groups == 0
+        self.n_groups = n_groups
+        self.n_heads_per_group = n_heads // n_groups
+        self.head_dim = head_dim
+        self.o_lora_rank = o_lora_rank
+        in_per_group = self.n_heads_per_group * head_dim  # 8 * 512 = 4096
+        out_total = n_groups * o_lora_rank  # 8 * 1024 = 8192
+        self.weight = nn.Parameter(torch.zeros(out_total, in_per_group))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        shape = x.shape
-        # [..., groups * in_per_group] -> [..., groups, in_per_group]
-        x_g = x.reshape(*shape[:-1], self.groups, self.in_per_group)
-        # weight -> [groups, out_per_group, in_per_group]
-        w = self.weight.reshape(self.groups, self.out_per_group, self.in_per_group)
-        # Grouped matmul: [..., g, in] @ [g, out, in]^T -> [..., g, out]
-        out = torch.einsum("...gi,goi->...go", x_g, w)
-        return out.reshape(*shape[:-1], self.groups * self.out_per_group)
+    def forward(self, o: torch.Tensor) -> torch.Tensor:
+        # o: [..., n_heads, head_dim]
+        shape = o.shape[:-2]
+        # -> [..., n_groups, n_heads_per_group * head_dim]
+        o_g = o.reshape(*shape, self.n_groups, self.n_heads_per_group * self.head_dim)
+        # weight: [n_groups * o_lora_rank, n_heads_per_group * head_dim]
+        #      -> [n_groups, o_lora_rank, n_heads_per_group * head_dim]
+        w = self.weight.reshape(self.n_groups, self.o_lora_rank, self.n_heads_per_group * self.head_dim)
+        # einsum: [..., g, d] x [g, r, d]^T -> [..., g, r]
+        out = torch.einsum("...gd,grd->...gr", o_g, w)
+        # -> [..., n_groups * o_lora_rank]
+        return out.reshape(*shape, self.n_groups * self.o_lora_rank)
 
     def init_weights(self, init_std: float = 0.02) -> None:
         nn.init.trunc_normal_(self.weight, mean=0.0, std=init_std)
 
 
+# ---------------------------------------------------------------------------
+# HC (Hyper-Connections) helpers
+# ---------------------------------------------------------------------------
+
+
+def hc_pre_approx(x: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, None, None]:
+    """Approximate hc_pre via simple mean-pooling across the hc_mult dimension.
+
+    The full implementation requires the hc_split_sinkhorn CUDA kernel
+    (from the official inference code).  This approximation allows the model
+    to run end-to-end during development without the kernel.
+
+    Args:
+        x: [bsz, seq, hc_mult, dim]
+
+    Returns:
+        reduced: [bsz, seq, dim]
+        post, comb: None (placeholders; hc_post uses a broadcast fallback)
+    """
+    return x.mean(dim=2), None, None
+
+
+def hc_post_approx(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: None,
+    comb: None,
+) -> torch.Tensor:
+    """Approximate hc_post via broadcast expansion.
+
+    Adds the updated x to all hc_mult copies of the residual.
+
+    Args:
+        x:        [bsz, seq, dim]
+        residual: [bsz, seq, hc_mult, dim]
+
+    Returns:
+        [bsz, seq, hc_mult, dim]
+    """
+    return residual + x.unsqueeze(2)
+
+
+# ---------------------------------------------------------------------------
+# Main attention layer
+# ---------------------------------------------------------------------------
+
+
 class DeepseekV4Attention(nn.Module):
     """GQA attention with Q/O LoRA for DeepSeek V4.
 
-    Weight layout (HF names in parentheses):
-      wq_a  (attn.wq_a) : hidden_size -> q_lora_rank
-      q_norm (attn.q_norm): RMSNorm on q_lora_rank
-      wq_b  (attn.wq_b) : q_lora_rank -> n_heads * head_dim
-      wkv   (attn.wkv)  : hidden_size -> n_kv_heads * 2 * head_dim  (K||V)
-      kv_norm(attn.kv_norm): RMSNorm on head_dim, applied to K
-      wo_a  (attn.wo_a) : n_heads * head_dim -> o_lora_rank  (grouped)
-      wo_b  (attn.wo_b) : o_lora_rank -> hidden_size
-      attn_sink(attn.attn_sink): learnable sink [1, 1, n_kv_heads, 2*head_dim]
+    K = V = wkv(x):  a single head_dim latent vector used as both key and value.
+    attn_sink      :  per-head scalar bias (shape [n_heads]) applied to the
+                      "sink" position in sparse_attn.  Stored as float32.
+    wo_a           :  grouped projection, weight [n_groups*o_lora_rank,
+                                                   n_heads_per_group*head_dim].
     """
 
     def __init__(self, config: DeepseekV4Config, backend: BackendConfig):
         super().__init__()
 
         self.n_heads = config.num_attention_heads
-        self.n_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
@@ -125,24 +207,24 @@ class DeepseekV4Attention(nn.Module):
         self.q_norm = initialize_rms_norm_module(rms_norm_impl, self.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = initialize_linear_module(linear_impl, self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
 
-        # Combined KV projection: hidden -> [K || V] where each is n_kv_heads * head_dim
-        self.wkv = initialize_linear_module(linear_impl, hidden_size, self.n_kv_heads * self.head_dim * 2, bias=False)
-        # kv_norm normalizes the K part before RoPE
+        # Combined KV projection: K = V = wkv(x), single latent of dim head_dim
+        self.wkv = initialize_linear_module(linear_impl, hidden_size, self.head_dim, bias=False)
         self.kv_norm = initialize_rms_norm_module(rms_norm_impl, self.head_dim, eps=config.rms_norm_eps)
 
-        # O LoRA (grouped block-diagonal first step, then linear)
-        self.wo_a = GroupedLinear(
-            in_features=self.n_heads * self.head_dim,
-            out_features=self.o_lora_rank,
-            groups=self.o_groups,
+        # Grouped output projection
+        self.wo_a = GroupedOutputProjection(
+            n_heads=self.n_heads,
+            head_dim=self.head_dim,
+            o_lora_rank=self.o_lora_rank,
+            n_groups=self.o_groups,
         )
-        self.wo_b = initialize_linear_module(linear_impl, self.o_lora_rank, hidden_size, bias=False)
+        self.wo_b = initialize_linear_module(linear_impl, self.o_groups * self.o_lora_rank, hidden_size, bias=False)
 
-        # Attention sink: a learnable [K||V] token prepended to every KV sequence.
-        # Shape: [1, 1, n_kv_heads, 2 * head_dim] so it broadcasts over batch/seq.
+        # Attention sink: per-head learnable scalar (stored in float32 per official impl)
+        # Shape: [n_heads] — broadcast over the sink position in sparse_attn.
         self.register_parameter(
             "attn_sink",
-            nn.Parameter(torch.zeros(1, 1, self.n_kv_heads, self.head_dim * 2)),
+            nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32)),
         )
 
         # Softmax scale with optional YaRN correction
@@ -156,15 +238,15 @@ class DeepseekV4Attention(nn.Module):
                 mscale = yarn_get_mscale(factor, mscale)
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
-        # num_gqa_groups = n_heads / n_kv_heads (64 for V4 Flash since n_kv_heads=1)
-        num_gqa_groups = self.n_heads // self.n_kv_heads if self.n_kv_heads > 1 else None
+        # V4 uses 1 KV head (K=V=kv), so num_gqa_groups = n_heads for standard GQA path
         self.attn_module, self.attn_func = initialize_attn_module_and_func(
             attn_impl=backend.attn,
             num_attention_heads=self.n_heads,
             num_qk_channels=self.head_dim,
             num_v_channels=self.head_dim,
             softmax_scale=self.softmax_scale,
-            num_gqa_groups=num_gqa_groups,
+            # GQA with n_kv_heads=1: num_gqa_groups=n_heads
+            num_gqa_groups=self.n_heads,
         )
 
     def forward(
@@ -189,25 +271,23 @@ class DeepseekV4Attention(nn.Module):
         else:
             q = q.view(bsz, seq_len, self.n_heads, self.head_dim)
 
+        # Per-head RMSNorm on Q (as in official model: q *= rsqrt(q.sq.mean(-1, keepdim=True)))
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + 1e-6).to(q.dtype)
+
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # --- KV path ---
-        kv = self.wkv(x)  # [..., n_kv_heads * 2 * head_dim]
-        if qkv_format == "thd":
-            kv = kv.view(num_tokens, self.n_kv_heads, self.head_dim * 2)
-        else:
-            kv = kv.view(bsz, seq_len, self.n_kv_heads, self.head_dim * 2)
-        k_full, v = torch.split(kv, self.head_dim, dim=-1)
+        # --- KV path: K = V = single latent ---
+        kv = self.kv_norm(self.wkv(x))  # [..., head_dim]
+        kv_nope, kv_pe = torch.split(kv, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        # Apply kv_norm to the entire K vector (head_dim), then split nope/rope
-        k_full = self.kv_norm(k_full)
-        k_nope, k_pe = torch.split(k_full, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # --- RoPE ---
+        # RoPE
         cu_seqlens = attn_kwargs.get("cu_seqlens", None)
-        q_pe, k_pe = apply_rotary_emb_qk(
+        # kv_pe needs a head dimension for apply_rotary_emb_qk
+        head_unsqueeze_dim = 2 if qkv_format == "bshd" else 1
+        kv_pe = kv_pe.unsqueeze(head_unsqueeze_dim)
+        q_pe, kv_pe = apply_rotary_emb_qk(
             q_pe,
-            k_pe,
+            kv_pe,
             freqs_cis,
             format=qkv_format,
             rope_fusion=self.rope_fusion,
@@ -215,41 +295,31 @@ class DeepseekV4Attention(nn.Module):
             cp_size=attn_kwargs.get("cp_size", 1),
             cp_rank=attn_kwargs.get("cp_rank", 0),
         )
+        kv_pe = kv_pe.squeeze(head_unsqueeze_dim)
 
         q = torch.cat([q_nope, q_pe], dim=-1)
-        k = torch.cat([k_nope, k_pe], dim=-1)
+        kv = torch.cat([kv_nope, kv_pe], dim=-1)
 
-        # --- Attention sink ---
-        # Prepend the learnable sink [K||V] as position 0 of the KV sequence.
-        # sink shape: [1, 1, n_kv_heads, 2*head_dim] -> broadcast over batch
-        sink_kv = self.attn_sink.expand(bsz if qkv_format == "bshd" else 1, 1, -1, -1)
-        sink_k, sink_v = torch.split(sink_kv, self.head_dim, dim=-1)
+        # Expand kv to n_heads (K=V shared across all heads) for standard attention path
         if qkv_format == "thd":
-            sink_k = sink_k.view(1, self.n_kv_heads, self.head_dim)
-            sink_v = sink_v.view(1, self.n_kv_heads, self.head_dim)
-            k = torch.cat([sink_k, k], dim=0)
-            v = torch.cat([sink_v, v], dim=0)
+            k = kv.unsqueeze(1).expand(num_tokens, self.n_heads, self.head_dim)
+            v = k  # K = V
         else:
-            k = torch.cat([sink_k, k], dim=1)
-            v = torch.cat([sink_v, v], dim=1)
-
-        # attention_mask must account for the extra sink position if provided
-        # TODO: extend mask by one column on the left when attention_mask is not None
+            k = kv.unsqueeze(2).expand(bsz, seq_len, self.n_heads, self.head_dim)
+            v = k  # K = V
 
         q, k, v, _attn_kwargs = preprocess_args_and_kwargs_for_attn(
             q, k, v, attention_mask, self.backend.attn, **attn_kwargs
         )
-        x = self.attn_func(q, k, v, **_attn_kwargs)
-        x = postprocess_output_for_attn(x, self.backend.attn)
+        o = self.attn_func(q, k, v, **_attn_kwargs)
+        o = postprocess_output_for_attn(o, self.backend.attn)
 
-        # Remove sink position from output if returned (only affects k/v, not q/output)
-        # Output shape is [..., n_heads, head_dim] - no sink dimension here.
-
-        # --- O LoRA ---
-        flatten_dim = 2 if qkv_format == "bshd" else 1
-        x_flat = x.flatten(flatten_dim)  # [..., n_heads * head_dim]
-        x_lora = self.wo_a(x_flat)  # [..., o_lora_rank]
-        return self.wo_b(x_lora)  # [..., hidden_size]
+        # --- O path (grouped) ---
+        # o: [bsz, seq, n_heads, head_dim] or [num_tokens, n_heads, head_dim]
+        # Apply inverse RoPE to the pe part of o before projection (per official impl)
+        # TODO: apply_rotary_emb(o[..., -rope_head_dim:], freqs_cis, inverse=True)
+        x_out = self.wo_b(self.wo_a(o))  # wo_a handles the reshape internally
+        return x_out
 
     def init_weights(self, buffer_device: torch.device, init_std: float = 0.02) -> None:
         for linear in (self.wq_a, self.wq_b, self.wkv, self.wo_b):
