@@ -60,6 +60,7 @@ from nemo_automodel.components.moe.config import MoEConfig
 from nemo_automodel.components.moe.state_dict_utils import (
     create_dtensor_from_local,
     get_expert_range_for_rank_from_mesh,
+    get_expert_slice_for_rank,
     get_submesh,
     is_dtensor,
     should_load_expert_for_rank,
@@ -373,21 +374,25 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         return ((r + BLOCK_SIZE - 1) // BLOCK_SIZE, (c + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
     def _split_merged_expert(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
-        """Inverse of expert aggregation: split gate_and_up/down stacks into per-expert keys."""
+        """Inverse of expert aggregation: split gate_and_up/down stacks into per-expert keys.
+
+        Handles DTensor inputs (EP-sharded) by working on the local shard only,
+        emitting keys only for the experts owned by the current rank.
+        """
         gate_up_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.gate_and_up_projs$")
         down_pat = re.compile(r"^(model\.layers\.(\d+)\.mlp\.experts)\.down_projs$")
 
         m = gate_up_pat.match(fqn)
         if m:
             layer_num = m.group(2)
-            # tensor: [n_experts, hidden_dim, 2 * inter_dim] (stacked, transposed)
-            n = tensor.shape[0]
-            inter_dim = tensor.shape[-1] // 2
+            n_total = self.moe_config.n_routed_experts
+            local_tensor, start_eid, end_eid = get_expert_slice_for_rank(tensor, n_total)
+            inter_dim = local_tensor.shape[-1] // 2
             result = []
-            for eid in range(n):
-                t = tensor[eid]  # [hidden_dim, 2*inter_dim]
+            for local_i in range(local_tensor.shape[0]):
+                t = local_tensor[local_i]  # [hidden_dim, 2*inter_dim]
                 gate_t, up_t = t.split(inter_dim, dim=-1)
-                # V4 HF uses w1 (gate) and w3 (up)
+                eid = start_eid + local_i
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w1.weight", gate_t.T))
                 result.append((f"layers.{layer_num}.ffn.experts.{eid}.w3.weight", up_t.T))
             return result
@@ -395,11 +400,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         m = down_pat.match(fqn)
         if m:
             layer_num = m.group(2)
-            # tensor: [n_experts, inter_dim, hidden_dim] (stacked, transposed)
+            n_total = self.moe_config.n_routed_experts
+            local_tensor, start_eid, end_eid = get_expert_slice_for_rank(tensor, n_total)
             result = []
-            for eid in range(tensor.shape[0]):
-                # V4 HF uses w2 (down)
-                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", tensor[eid].T))
+            for local_i in range(local_tensor.shape[0]):
+                eid = start_eid + local_i
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", local_tensor[local_i].T))
             return result
 
         return [(fqn, tensor)]
