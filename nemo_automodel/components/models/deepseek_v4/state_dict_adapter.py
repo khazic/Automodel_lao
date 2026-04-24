@@ -378,14 +378,18 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             quantized = []
             for key, value in result:
                 if key.endswith(".weight") and not self._is_non_quantized(key):
-                    # V4 Flash routed-expert weights are FP4 (e2m1) packed in int8
-                    # with FP8 e8m0 scales — re-packing is non-trivial, so emit them
-                    # as bf16 here.  Shared experts + non-expert weights keep the
-                    # standard FP8 e4m3fn + fp32 128×128 scale layout.
-                    if self._is_expert_weight_key(key):
-                        quantized.append((key, value))
-                        continue
                     base = key[: -len(".weight")]
+                    if self._is_expert_weight_key(key):
+                        # V4 Flash routed experts are stored as FP4 e2m1 packed two
+                        # values per int8 byte, with per-row / 32-col e8m0 scales.
+                        # DCP validates shape + dtype against the checkpoint BEFORE
+                        # dequantization happens, so the placeholders must match the
+                        # on-disk layout exactly.  We emit empty tensors (content is
+                        # overwritten by dcp.load) with the packed shape/dtype.
+                        int8_val, e8m0_scale = self._build_fp4_expert_placeholders(value)
+                        quantized.append((key, int8_val))
+                        quantized.append((base + ".scale", e8m0_scale))
+                        continue
                     if is_dtensor(value):
                         # Preserve DTensor structure so DCP knows the global shape
                         # and can shard the checkpoint load correctly.  Converting
@@ -404,6 +408,38 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             return quantized
 
         return result
+
+    @staticmethod
+    def _build_fp4_expert_placeholders(value: Any) -> tuple[Any, Any]:
+        """Return (int8 packed weight, float8_e8m0fnu scale) placeholders whose
+        shapes / dtypes match the on-disk V4 Flash routed-expert layout.
+
+        The current `value` is the dequantized bf16 tensor with shape [out, in];
+        the checkpoint tensor is int8 [out, in // 2] with an e8m0 scale
+        [out, in // 32].  DCP only uses these placeholders for shape/dtype
+        validation and as the destination buffer — contents are overwritten on
+        load, so we build empty tensors instead of re-packing real data.
+        """
+        if is_dtensor(value):
+            local = value.to_local()
+            in_dim = local.shape[-1]
+            assert in_dim % FP4_COL_BLOCK == 0, f"V4 expert in-dim {in_dim} must be divisible by {FP4_COL_BLOCK}"
+            packed = torch.empty(*local.shape[:-1], in_dim // 2, dtype=torch.int8, device=local.device)
+            scale = torch.empty(
+                *local.shape[:-1],
+                in_dim // FP4_COL_BLOCK,
+                dtype=torch.float8_e8m0fnu,
+                device=local.device,
+            )
+            packed_d = DTensor.from_local(packed, value.device_mesh, value.placements)
+            scale_d = DTensor.from_local(scale, value.device_mesh, value.placements)
+            return packed_d, scale_d
+
+        in_dim = value.shape[-1]
+        assert in_dim % FP4_COL_BLOCK == 0, f"V4 expert in-dim {in_dim} must be divisible by {FP4_COL_BLOCK}"
+        packed = torch.empty(*value.shape[:-1], in_dim // 2, dtype=torch.int8)
+        scale = torch.empty(*value.shape[:-1], in_dim // FP4_COL_BLOCK, dtype=torch.float8_e8m0fnu)
+        return packed, scale
 
     _NON_QUANTIZED_PATTERNS = [
         "attn_norm.weight",
