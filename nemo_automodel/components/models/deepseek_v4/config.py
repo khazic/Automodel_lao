@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from transformers import PretrainedConfig
 
 
@@ -32,6 +34,25 @@ class DeepseekV4Config(PretrainedConfig):
 
     model_type = "deepseek_v4"
     keys_to_ignore_at_inference = ["past_key_values"]
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ) -> "DeepseekV4Config | tuple[DeepseekV4Config, dict[str, Any]]":
+        """Load DeepSeek V4 config with a checkpoint-compatible MoE default."""
+        has_explicit_moe_intermediate_size = "moe_intermediate_size" in kwargs
+        result = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        config = result[0] if isinstance(result, tuple) else result
+        if (
+            not has_explicit_moe_intermediate_size
+            and config.hidden_size == 4096
+            and config.moe_intermediate_size == 2048
+        ):
+            config.moe_intermediate_size = 1024
+        return result
 
     def __init__(
         self,
