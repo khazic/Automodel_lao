@@ -80,6 +80,47 @@ class MaskedCrossEntropy(nn.Module):
             labels = labels.full_tensor()
 
         loss = F.cross_entropy(logits, labels, reduction=self.reduction)
+        # --- TEMP DIAGNOSTIC (rank 0, once) — remove after V4 loss is understood
+        import os
+        import sys
+        if not getattr(MaskedCrossEntropy, "_dbg_done", False) and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            MaskedCrossEntropy._dbg_done = True
+            valid = labels != self.ignore_index
+            n_valid = int(valid.sum())
+            nan = bool(torch.isnan(logits).any())
+            inf = bool(torch.isinf(logits).any())
+            print(
+                f"[ce-diag] logits shape={tuple(logits.shape)} dtype={logits.dtype} "
+                f"min={float(logits.min()):.2f} max={float(logits.max()):.2f} "
+                f"mean={float(logits.mean()):.3f} std={float(logits.std()):.3f} "
+                f"nan={nan} inf={inf}",
+                file=sys.stderr, flush=True,
+            )
+            if n_valid > 0:
+                vlog = logits[valid]
+                vlab = labels[valid]
+                pred = vlog.argmax(dim=-1)
+                match = (pred == vlab).float().mean().item()
+                # log-prob at the correct label vs uniform baseline
+                logp = torch.log_softmax(vlog, dim=-1)
+                correct_logp = logp.gather(-1, vlab.unsqueeze(-1)).squeeze(-1)
+                print(
+                    f"[ce-diag] n_valid_labels={n_valid} argmax_match={match*100:.1f}% "
+                    f"mean_correct_logp={float(correct_logp.mean()):.3f} "
+                    f"median_correct_logp={float(correct_logp.median()):.3f} "
+                    f"(random baseline logp = -{torch.log(torch.tensor(logits.size(-1))).item():.3f})",
+                    file=sys.stderr, flush=True,
+                )
+                # Sample of first 5 valid positions: predicted top-3 vs target
+                sample = min(5, int(n_valid))
+                for i in range(sample):
+                    top_v, top_i = vlog[i].topk(3)
+                    print(
+                        f"[ce-diag] pos{i}: target_tok={int(vlab[i])} "
+                        f"top3=[{' '.join(f'{int(t)}({float(v):.1f})' for t, v in zip(top_i, top_v))}]",
+                        file=sys.stderr, flush=True,
+                    )
+        # ---------------------------------------------------------------
         if num_label_tokens is not None:
             assert self.reduction == "sum", "num_label_tokens is only supported when reduction is 'sum'"
             if num_label_tokens == 0:
