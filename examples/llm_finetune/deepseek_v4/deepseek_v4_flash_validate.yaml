@@ -12,13 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Minimal validation run for DeepSeek V4 Flash — single node, 8×A100-80G.
+# Minimal infra validation for DeepSeek V4 Flash — single node, 8×A100-80G.
+# Uses only 4 transformer layers (emb + 4×layer + lm_head) to quickly verify
+# EP+PP infrastructure end-to-end without needing to load all 43 layers.
+# Loss will be large (expected); the goal is finite logits and no NCCL/shape errors.
+#
 # Parallelism: EP=4 × PP=2 = 8 GPUs total.
 #   - 256 experts / EP=4 → 64 local experts per GPU
-#   - 43 layers / PP=2 → ~21-22 layers per pipeline stage
-# Runs 5 training steps + 1 validation step to verify loss/logits are finite.
+#   - 4 layers / PP=2 → 2 layers per pipeline stage
 #
-#   PYTHONPATH=/llm-align/liuchonghan/Automodel_lao automodel \
+#   PYTHONPATH=/llm-align/liuchonghan/Automodel_lao python -m nemo_automodel.cli.app \
 #     examples/llm_finetune/deepseek_v4/deepseek_v4_flash_validate.yaml \
 #     --nproc-per-node 8
 
@@ -62,6 +65,12 @@ model:
     _target_: nemo_automodel.components.models.deepseek_v4.config.DeepseekV4Config.from_pretrained
     pretrained_model_name_or_path: /llm-align/open_models/Deepseekv4
     name_or_path: /llm-align/open_models/Deepseekv4
+    # Override to use only 4 layers for fast infra validation.
+    # Layers 4-42 are simply not created; checkpoint keys for them are ignored (strict=False).
+    num_hidden_layers: 4
+    num_hash_layers: 0
+    compress_ratios: [0, 0, 0, 0]
+    num_nextn_predict_layers: 0
   trust_remote_code: false
   load_base_model: true
   backend:
