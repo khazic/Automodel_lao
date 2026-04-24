@@ -314,16 +314,6 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Splits stacked expert weights back to per-expert w1/w2/w3 tensors,
         applies key renaming in reverse, and optionally quantizes to FP8.
         """
-        # --- TEMP DEBUG (print to stderr — WARNING-level logging is filtered
-        # out by DCP's logger config before it reaches the user) ----------
-        import sys as _sys
-
-        _incoming = [k for k in state_dict.keys() if "gate" in k and ("bias" in k or "e_score_correction" in k)]
-        print(f"[v4-adapter] incoming gate-bias keys ({len(_incoming)}):", file=_sys.stderr, flush=True)
-        for _k in _incoming:
-            print(f"  {_k}", file=_sys.stderr, flush=True)
-        # ------------------------------------------------------------------
-
         state_dict = self._drop_hash_layer_gate_bias(state_dict, _HashBiasScope.INTERNAL)
 
         hf_state_dict: dict[str, Any] = {}
@@ -339,22 +329,33 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # keys in case any intermediate step emitted them in HF format directly
         # (observed in practice during DCP load even after the internal-side drop).
         hf_state_dict = self._drop_hash_layer_gate_bias(hf_state_dict, _HashBiasScope.HF)
-
-        # --- TEMP DEBUG: list every outgoing gate-bias key and fail loudly
-        # if one slipped through for a hash-routing layer.  We use an
-        # explicit AssertionError so the message is guaranteed to surface
-        # in every rank's traceback.
-        _outgoing = [k for k in hf_state_dict.keys() if "gate" in k and "bias" in k]
-        print(f"[v4-adapter] outgoing gate-bias keys ({len(_outgoing)}):", file=_sys.stderr, flush=True)
-        for _k in _outgoing:
-            print(f"  {_k}", file=_sys.stderr, flush=True)
-        _num_hash = int(getattr(self.config, "num_hash_layers", 0) or 0)
-        _hash_ids = {str(i) for i in range(_num_hash)}
-        _bad = [k for k in _outgoing if (_m := _HashBiasScope.HF.value.match(k)) and _m.group(1) in _hash_ids]
-        if _bad:
-            raise AssertionError(f"[v4-adapter] hash-layer gate.bias keys leaked past filter: {_bad}")
-        # ------------------------------------------------------------------
         return hf_state_dict
+
+    def _checkpoint_num_hash_layers(self) -> int:
+        """Read ``num_hash_layers`` directly from the checkpoint's config.json.
+
+        We cannot rely on ``self.config.num_hash_layers`` alone: a YAML can
+        legitimately override the model's hash-layer count to 0 (e.g. to
+        disable hash routing in the forward path), but the on-disk checkpoint
+        still has its original value and therefore still omits gate.bias for
+        the first ``num_hash_layers`` layers.  To decide what to drop at load
+        time we must know the checkpoint's own value.
+        """
+        import json as _json
+        import os as _os
+
+        ckpt_path = getattr(self.config, "_name_or_path", None) or getattr(self.config, "name_or_path", None)
+        if not ckpt_path:
+            return 0
+        cfg_json = _os.path.join(ckpt_path, "config.json")
+        if not _os.path.isfile(cfg_json):
+            return 0
+        try:
+            with open(cfg_json) as f:
+                data = _json.load(f)
+        except Exception:
+            return 0
+        return int(data.get("num_hash_layers", 0) or 0)
 
     def _drop_hash_layer_gate_bias(self, state_dict: dict[str, Any], scope: "_HashBiasScope") -> dict[str, Any]:
         """The first ``num_hash_layers`` layers use hash-clustering routing and
@@ -368,33 +369,21 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         form (``model.layers.{i}.mlp.gate.e_score_correction_bias``) or the
         post-rename HF form (``layers.{i}.ffn.gate.bias``).
         """
-        import sys as _sys
-
-        num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
-        print(
-            f"[v4-adapter][_drop_hash_layer_gate_bias] scope={scope.name} "
-            f"num_hash_layers={num_hash_layers} config_type={type(self.config).__name__}",
-            file=_sys.stderr,
-            flush=True,
-        )
+        # Prefer the checkpoint's own num_hash_layers over the (possibly YAML
+        # overridden) model config — we need to match the on-disk layout.
+        num_hash_layers = self._checkpoint_num_hash_layers()
         if num_hash_layers <= 0:
-            print("[v4-adapter][_drop_hash_layer_gate_bias] EARLY RETURN (no hash layers)", file=_sys.stderr, flush=True)
+            num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
+        if num_hash_layers <= 0:
             return state_dict
         hash_layer_ids = {str(i) for i in range(num_hash_layers)}
         pat = scope.value
         filtered: dict[str, Any] = {}
-        dropped = []
         for key, value in state_dict.items():
             m = pat.match(key)
             if m is not None and m.group(1) in hash_layer_ids:
-                dropped.append(key)
                 continue
             filtered[key] = value
-        print(
-            f"[v4-adapter][_drop_hash_layer_gate_bias] scope={scope.name} dropped {len(dropped)}: {dropped}",
-            file=_sys.stderr,
-            flush=True,
-        )
         return filtered
 
     # Internal -> HF name table (inverse of _HF_TO_INTERNAL_RENAMES)
