@@ -256,30 +256,33 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             else:  # w2 = down_proj
                 by_layer[layer_num]["down"][expert_num] = value
 
-            # Once all experts for this layer's gate_and_up are ready, stack them
-            gu_layer = by_layer[layer_num]["gate_and_up"]
-            all_ready = len(gu_layer) == expected_per_rank and all(
-                isinstance(d, dict) and "w1" in d and "w3" in d for d in gu_layer.values()
-            )
-            if all_ready:
-                expert_ids = sorted(gu_layer.keys())
-                tensors = []
-                for eid in expert_ids:
-                    gate_w = gu_layer[eid]["w1"]
-                    up_w = gu_layer[eid]["w3"]
-                    if is_dtensor(gate_w):
-                        gate_w = gate_w.to_local()
-                    if is_dtensor(up_w):
-                        up_w = up_w.to_local()
-                    tensors.append(torch.cat([gate_w.T, up_w.T], dim=-1))
-                stacked = torch.stack(tensors, dim=0).to(self.dtype)
-                native_key = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
-                out[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
-                del by_layer[layer_num]["gate_and_up"]
+            # Once all experts for this layer's gate_and_up are ready, stack them.
+            # The sub-dict is popped below, so later iterations that touch the
+            # same layer (e.g. the paired w2 key) must tolerate its absence.
+            gu_layer = by_layer[layer_num].get("gate_and_up")
+            if gu_layer is not None:
+                all_ready = len(gu_layer) == expected_per_rank and all(
+                    isinstance(d, dict) and "w1" in d and "w3" in d for d in gu_layer.values()
+                )
+                if all_ready:
+                    expert_ids = sorted(gu_layer.keys())
+                    tensors = []
+                    for eid in expert_ids:
+                        gate_w = gu_layer[eid]["w1"]
+                        up_w = gu_layer[eid]["w3"]
+                        if is_dtensor(gate_w):
+                            gate_w = gate_w.to_local()
+                        if is_dtensor(up_w):
+                            up_w = up_w.to_local()
+                        tensors.append(torch.cat([gate_w.T, up_w.T], dim=-1))
+                    stacked = torch.stack(tensors, dim=0).to(self.dtype)
+                    native_key = f"model.layers.{layer_num}.mlp.experts.gate_and_up_projs"
+                    out[native_key] = create_dtensor_from_local(stacked, device_mesh, rank)
+                    del by_layer[layer_num]["gate_and_up"]
 
-            # Once all experts for this layer's down are ready, stack them
-            down_layer = by_layer[layer_num]["down"]
-            if len(down_layer) == expected_per_rank:
+            # Once all experts for this layer's down are ready, stack them.
+            down_layer = by_layer[layer_num].get("down")
+            if down_layer is not None and len(down_layer) == expected_per_rank:
                 expert_ids = sorted(down_layer.keys())
                 tensors = []
                 for eid in expert_ids:
