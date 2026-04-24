@@ -67,18 +67,20 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
 )
 
-# V4 routed-expert weights use per-row FP8 quantization with different column
-# group sizes for gate/up (w1/w3) vs down (w2) projections:
-#   w1, w3 (gate/up): 16-col groups  → scale [rows, ceil(cols/16)]
-#   w2     (down):    32-col groups  → scale [rows, ceil(cols/32)]
-# Non-expert weights use the standard BLOCK_SIZE×BLOCK_SIZE (128×128) format.
-EXPERT_COL_BLOCK_GATE_UP = 16
-EXPERT_COL_BLOCK_DOWN = 32
+# V4 Flash routed-expert weights are stored as FP4 (e2m1fn) packed two values per
+# int8 byte, with FP8 (e8m0fnu) per-row scales covering 32-column groups:
+#   weight: int8 with shape [out, in // 2]         (low nibble + high nibble = 2 fp4 values)
+#   scale:  float8_e8m0fnu with shape [out, in // 32]
+# Non-expert weights (attention, norms, embed, lm_head, shared experts) use the
+# standard FP8 e4m3fn with BLOCK_SIZE×BLOCK_SIZE (128×128) scaling.
+FP4_COL_BLOCK = 32
 
-
-def _expert_col_block(key: str) -> int:
-    """Return the FP8 column-group block size for a routed expert weight key."""
-    return EXPERT_COL_BLOCK_DOWN if ".w2." in key else EXPERT_COL_BLOCK_GATE_UP
+# FP4 e2m1 value table: low 3 bits -> mantissa/exponent, MSB -> sign.
+# Layout: [positive values for 0-7, negative values for 8-15].
+_FP4_E2M1_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.float32,
+)
 
 
 # HF V4 key -> internal key  (simple renames; expert & FP8 handled separately)
@@ -190,7 +192,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             if scale_key is not None:
                 scale = state_dict[scale_key]
                 if self._is_expert_weight_key(key):
-                    state_dict[key] = self._dequantize_expert_fp8(weight, scale, self.dtype, key)
+                    state_dict[key] = self._dequantize_expert_fp4(weight, scale, self.dtype)
                 else:
                     state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
                 scale_keys_to_remove.append(scale_key)
@@ -376,6 +378,13 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             quantized = []
             for key, value in result:
                 if key.endswith(".weight") and not self._is_non_quantized(key):
+                    # V4 Flash routed-expert weights are FP4 (e2m1) packed in int8
+                    # with FP8 e8m0 scales — re-packing is non-trivial, so emit them
+                    # as bf16 here.  Shared experts + non-expert weights keep the
+                    # standard FP8 e4m3fn + fp32 128×128 scale layout.
+                    if self._is_expert_weight_key(key):
+                        quantized.append((key, value))
+                        continue
                     base = key[: -len(".weight")]
                     if is_dtensor(value):
                         # Preserve DTensor structure so DCP knows the global shape
@@ -387,13 +396,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                         fp8_val = DTensor.from_local(local_fp8, value.device_mesh, value.placements)
                     else:
                         fp8_val = value.cpu().to(torch.float8_e4m3fn)
-                    # FP8 scale is a global (non-sharded) tensor.  Use value.shape
-                    # (global DTensor shape) so the placeholder matches the checkpoint.
-                    # Expert weights use per-row / 32-col-group scales (finer granularity).
-                    if self._is_expert_weight_key(key):
-                        scale = torch.ones(self._expert_scale_shape(value, key), dtype=torch.float32)
-                    else:
-                        scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
+                    scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
                     quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
                 else:
@@ -430,24 +433,49 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         r, c = weight.shape
         return ((r + BLOCK_SIZE - 1) // BLOCK_SIZE, (c + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
-    def _expert_scale_shape(self, weight: torch.Tensor, key: str) -> tuple[int, int]:
+    def _expert_scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
+        """Scale shape for an FP4 routed-expert weight tensor.
+
+        The weight argument should be the *unpacked* tensor (in the model-side
+        state dict, experts are already materialized at full dtype), so its
+        last dim is the true `in` dim and the scale has `in // 32` columns.
+        """
         r, c = weight.shape
-        block = _expert_col_block(key)
-        return (r, (c + block - 1) // block)
+        return (r, (c + FP4_COL_BLOCK - 1) // FP4_COL_BLOCK)
 
     @staticmethod
-    def _dequantize_expert_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, key: str) -> torch.Tensor:
-        """Dequantize V4 routed-expert FP8 weights.
+    def _dequantize_expert_fp4(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Unpack FP4 e2m1 packed-int8 weight and apply the per-row / 32-col e8m0 scale.
 
-        w1/w3 (gate/up): 16-col groups — scale[i,j] covers weight[i, j*16:(j+1)*16]
-        w2    (down):    32-col groups — scale[i,j] covers weight[i, j*32:(j+1)*32]
+        Packed layout: `weight.int8` holds two FP4 values per byte — the low nibble
+        at even column index, the high nibble at the following odd column — so the
+        logical shape is `[out, weight.size(-1) * 2]`.
         """
-        block = _expert_col_block(key)
         weight_local = weight.to_local() if is_dtensor(weight) else weight
         scale_local = scale.to_local() if is_dtensor(scale) else scale
-        weight_f32 = weight_local.to(torch.float32)
-        scale_expanded = scale_local.repeat_interleave(block, dim=1)[:, : weight_f32.shape[1]]
-        return (weight_f32 * scale_expanded).to(dtype)
+
+        # Step 1: unpack two FP4 values from each byte.
+        weight_u8 = weight_local.contiguous().view(torch.uint8)
+        low = (weight_u8 & 0x0F).long()
+        high = ((weight_u8 >> 4) & 0x0F).long()
+        # Interleave (low, high) per byte so column indices match the original layout.
+        table = _FP4_E2M1_TABLE.to(weight_u8.device)
+        fp4_vals = torch.stack([table[low], table[high]], dim=-1).flatten(-2)  # [out, in]
+
+        # Step 2: decode e8m0 scale to fp32. e8m0 stores 2^(e-127), or 0 when e==0.
+        # A simple .to(torch.float32) works when PyTorch supports the e8m0 dtype;
+        # fall back to the explicit formula otherwise.
+        scale_u8 = scale_local.contiguous().view(torch.uint8).int()
+        scale_f32 = torch.where(
+            scale_u8 == 0,
+            torch.zeros_like(scale_u8, dtype=torch.float32),
+            torch.pow(2.0, (scale_u8 - 127).float()),
+        )
+
+        # Step 3: broadcast scale across the 32 columns it covers.
+        scale_expanded = scale_f32.repeat_interleave(FP4_COL_BLOCK, dim=-1)
+        scale_expanded = scale_expanded[..., : fp4_vals.shape[-1]]
+        return (fp4_vals * scale_expanded).to(dtype)
 
     def _split_merged_expert(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
         """Inverse of expert aggregation: split gate_and_up/down stacks into per-expert keys.
