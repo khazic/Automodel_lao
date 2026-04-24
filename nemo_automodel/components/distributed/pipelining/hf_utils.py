@@ -540,25 +540,9 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
         # None (hash-routing layers should be packed onto stage 0 to receive it).
         stage_input_ids = input_ids if has_embed else None
         layers = getattr(self, "layers", None)
-        # TEMP DIAG: capture per-layer stats into a module attr so the final
-        # norm hook below can emit them alongside the pre/post-norm numbers.
-        _dbg_capture = not getattr(pipeline_forward_deepseek_v4, "_dbg_done", False)
-        if _dbg_capture:
-            import os as _os
-            import sys as _sys
-
-            _rank = _os.environ.get("RANK", "?")
-            h0 = h.float()
-            print(
-                f"[v4-diag rank={_rank}] input h (post hc_mult expand): shape={tuple(h0.shape)} "
-                f"min={float(h0.min()):.3f} max={float(h0.max()):.3f} "
-                f"mean={float(h0.mean()):.4f} std={float(h0.std()):.4f}",
-                file=_sys.stderr,
-                flush=True,
-            )
         if layers is not None:
             layer_iter = layers.values() if hasattr(layers, "values") else layers
-            for _i, layer in enumerate(layer_iter):
+            for layer in layer_iter:
                 if layer is None:
                     continue
                 h = layer(
@@ -568,40 +552,10 @@ def create_pipeline_forward_deepseek_v4() -> Callable:
                     padding_mask=padding_mask,
                     input_ids=stage_input_ids,
                 )
-                if _dbg_capture:
-                    hs = h.float()
-                    import sys as _sys
-
-                    print(
-                        f"[v4-diag rank={_rank}] after block {_i}: shape={tuple(hs.shape)} "
-                        f"min={float(hs.min()):.3f} max={float(hs.max()):.3f} "
-                        f"mean={float(hs.mean()):.4f} std={float(hs.std()):.4f}",
-                        file=_sys.stderr,
-                        flush=True,
-                    )
 
         # Last inner stage: collapse the hc_mult axis and apply the final norm.
         if has_norm:
-            h_pre = h.mean(dim=2)
-            h = self.norm(h_pre)
-            # --- TEMP DIAGNOSTIC (one-shot, last inner stage only)
-            if not getattr(pipeline_forward_deepseek_v4, "_dbg_done", False):
-                pipeline_forward_deepseek_v4._dbg_done = True
-                import os as _os
-                import sys as _sys
-
-                _rank = _os.environ.get("RANK", "?")
-                for _tag, _t in [
-                    ("pre-norm (h_reduced)", h_pre.float()),
-                    ("post-norm (-> lm_head)", h.float()),
-                ]:
-                    print(
-                        f"[v4-diag rank={_rank}] {_tag}: shape={tuple(_t.shape)} "
-                        f"min={float(_t.min()):.3f} max={float(_t.max()):.3f} "
-                        f"mean={float(_t.mean()):.4f} std={float(_t.std()):.4f}",
-                        file=_sys.stderr,
-                        flush=True,
-                    )
+            h = self.norm(h.mean(dim=2))
         return h
 
     return pipeline_forward_deepseek_v4

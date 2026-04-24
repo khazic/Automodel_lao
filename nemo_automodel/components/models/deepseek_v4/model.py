@@ -369,8 +369,7 @@ class DeepseekV4Model(nn.Module):
         # Expand embeddings to hc_mult copies: [B,S,dim] -> [B,S,hc_mult,dim]
         h = inputs_embeds.unsqueeze(2).expand(-1, -1, self.config.hc_mult, -1)
 
-        self._dbg_per_layer = []
-        for i, layer in enumerate(self.layers.values()):
+        for layer in self.layers.values():
             h = layer(
                 x=h,
                 freqs_cis=freqs_cis,
@@ -379,44 +378,10 @@ class DeepseekV4Model(nn.Module):
                 input_ids=input_ids,
                 **attn_kwargs,
             )
-            if not getattr(DeepseekV4Model, "_dbg_fh_done", False):
-                hf = h.float()
-                self._dbg_per_layer.append(
-                    f"shape={tuple(hf.shape)} min={float(hf.min()):.3f} "
-                    f"max={float(hf.max()):.3f} mean={float(hf.mean()):.4f} "
-                    f"std={float(hf.std()):.4f}"
-                )
 
         # Reduce hc_mult copies -> [B,S,dim] for the final norm + lm_head
         h_reduced = h.mean(dim=2)
         out = self.norm(h_reduced) if self.norm else h_reduced
-        # --- TEMP DIAGNOSTIC: final hidden state going into lm_head
-        if not getattr(DeepseekV4Model, "_dbg_fh_done", False):
-            DeepseekV4Model._dbg_fh_done = True
-            import os
-            import sys
-
-            _rank = os.environ.get("RANK", "?")
-            hf = out.float()
-            hr = h_reduced.float()
-            print(
-                f"[v4-diag rank={_rank}] pre-norm h_reduced: shape={tuple(hr.shape)} "
-                f"min={float(hr.min()):.3f} max={float(hr.max()):.3f} "
-                f"mean={float(hr.mean()):.4f} std={float(hr.std()):.4f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            print(
-                f"[v4-diag rank={_rank}] post-norm (→lm_head): shape={tuple(hf.shape)} "
-                f"min={float(hf.min()):.3f} max={float(hf.max()):.3f} "
-                f"mean={float(hf.mean()):.4f} std={float(hf.std()):.4f}",
-                file=sys.stderr,
-                flush=True,
-            )
-            # Also per-layer stats
-            if hasattr(self, "_dbg_per_layer"):
-                for i, s in enumerate(self._dbg_per_layer):
-                    print(f"[v4-diag rank={_rank}] after block {i}: {s}", file=sys.stderr, flush=True)
         return out
 
     def update_moe_gate_bias(self) -> None:

@@ -575,17 +575,6 @@ def get_expert_activation_for_deepep(config: MoEConfig):
     if config.expert_activation == "swiglu":
         # DeepSeek V4 uses a clamped FP32 variant when swiglu_limit > 0.
         if getattr(config, "swiglu_limit", 0.0) > 0.0:
-            import os
-            import sys
-
-            if not getattr(get_expert_activation_for_deepep, "_dbg_clamp_done", False):
-                get_expert_activation_for_deepep._dbg_clamp_done = True
-                _rank = os.environ.get("RANK", "?")
-                print(
-                    f"[v4-act rank={_rank}] swiglu_clamped_deepep activated, limit={config.swiglu_limit}",
-                    file=sys.stderr,
-                    flush=True,
-                )
             return partial(swiglu_clamped_deepep, limit=config.swiglu_limit)
         return weighted_bias_swiglu_impl
     elif config.expert_activation == "quick_geglu":
