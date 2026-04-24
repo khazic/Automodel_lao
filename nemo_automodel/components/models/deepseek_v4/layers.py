@@ -198,12 +198,19 @@ def hc_pre(
     shape = x.shape
     orig_dtype = x.dtype
     x_flat = x.flatten(2).float()  # [B, S, hc_mult*dim]
+    # HC parameters are stored as float32 in the checkpoint but mixed-precision
+    # policies (FSDP MP / cast_model_to_dtype) may downcast them at runtime.
+    # Force back to float32 here so the mixer math stays in fp32 (matches the
+    # reference's ``_keep_fp32 = True`` param marker).
+    hc_fn_f = hc_fn.float()
+    hc_scale_f = hc_scale.float()
+    hc_base_f = hc_base.float()
     with torch.no_grad():
         x_sq_mean = x_flat.square().mean(-1, keepdim=True)
         rsqrt = torch.rsqrt(x_sq_mean + norm_eps)
-        mixes = torch.nn.functional.linear(x_flat, hc_fn) * rsqrt  # [B, S, mix_hc]
+        mixes = torch.nn.functional.linear(x_flat, hc_fn_f) * rsqrt  # [B, S, mix_hc]
         pre, post, comb = _hc_split_sinkhorn(
-            mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps
+            mixes, hc_scale_f, hc_base_f, hc_mult, sinkhorn_iters, hc_eps
         )
     x_viewed = x_flat.view(shape)
     y = (pre.unsqueeze(-1) * x_viewed).sum(dim=2)
