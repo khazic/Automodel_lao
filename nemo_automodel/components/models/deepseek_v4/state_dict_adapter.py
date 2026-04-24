@@ -67,10 +67,10 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
 )
 
-# V4 routed-expert weights use per-row quantization with 32-column groups.
+# V4 routed-expert weights use per-row quantization with 16-column groups.
 # Scale shape: [weight_rows, ceil(weight_cols / EXPERT_COL_BLOCK)]
 # Non-expert weights use the standard BLOCK_SIZE x BLOCK_SIZE (128x128) format.
-EXPERT_COL_BLOCK = 32
+EXPERT_COL_BLOCK = 16
 
 # HF V4 key -> internal key  (simple renames; expert & FP8 handled separately)
 _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
