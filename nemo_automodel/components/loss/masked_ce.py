@@ -80,11 +80,14 @@ class MaskedCrossEntropy(nn.Module):
             labels = labels.full_tensor()
 
         loss = F.cross_entropy(logits, labels, reduction=self.reduction)
-        # --- TEMP DIAGNOSTIC (rank 0, once) — remove after V4 loss is understood
+        # --- TEMP DIAGNOSTIC (once, from whichever rank the loss lands on)
         import os
         import sys
-        if not getattr(MaskedCrossEntropy, "_dbg_done", False) and int(os.environ.get("LOCAL_RANK", "0")) == 0:
+
+        if not getattr(MaskedCrossEntropy, "_dbg_done", False):
             MaskedCrossEntropy._dbg_done = True
+            _rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "?"))
+            print(f"[ce-diag] firing on rank={_rank}", file=sys.stderr, flush=True)
             valid = labels != self.ignore_index
             n_valid = int(valid.sum())
             nan = bool(torch.isnan(logits).any())
