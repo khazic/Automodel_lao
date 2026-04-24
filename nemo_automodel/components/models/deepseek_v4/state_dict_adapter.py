@@ -314,14 +314,14 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Splits stacked expert weights back to per-expert w1/w2/w3 tensors,
         applies key renaming in reverse, and optionally quantizes to FP8.
         """
-        # --- TEMP DEBUG (remove once V4 load is green) --------------------
-        # Log every key we saw that looks like a gate bias so we can confirm
-        # the filter matches the real runtime format.
-        import logging as _logging
+        # --- TEMP DEBUG (print to stderr — WARNING-level logging is filtered
+        # out by DCP's logger config before it reaches the user) ----------
+        import sys as _sys
 
-        for _k in list(state_dict.keys()):
-            if "gate" in _k and ("bias" in _k or "e_score_correction" in _k):
-                _logging.warning("[v4-adapter] incoming gate-bias key: %s", _k)
+        _incoming = [k for k in state_dict.keys() if "gate" in k and ("bias" in k or "e_score_correction" in k)]
+        print(f"[v4-adapter] incoming gate-bias keys ({len(_incoming)}):", file=_sys.stderr, flush=True)
+        for _k in _incoming:
+            print(f"  {_k}", file=_sys.stderr, flush=True)
         # ------------------------------------------------------------------
 
         state_dict = self._drop_hash_layer_gate_bias(state_dict, _HashBiasScope.INTERNAL)
@@ -340,10 +340,19 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # (observed in practice during DCP load even after the internal-side drop).
         hf_state_dict = self._drop_hash_layer_gate_bias(hf_state_dict, _HashBiasScope.HF)
 
-        # --- TEMP DEBUG -----------------------------------------------------
-        for _k in list(hf_state_dict.keys()):
-            if "gate" in _k and "bias" in _k:
-                _logging.warning("[v4-adapter] outgoing gate-bias key: %s", _k)
+        # --- TEMP DEBUG: list every outgoing gate-bias key and fail loudly
+        # if one slipped through for a hash-routing layer.  We use an
+        # explicit AssertionError so the message is guaranteed to surface
+        # in every rank's traceback.
+        _outgoing = [k for k in hf_state_dict.keys() if "gate" in k and "bias" in k]
+        print(f"[v4-adapter] outgoing gate-bias keys ({len(_outgoing)}):", file=_sys.stderr, flush=True)
+        for _k in _outgoing:
+            print(f"  {_k}", file=_sys.stderr, flush=True)
+        _num_hash = int(getattr(self.config, "num_hash_layers", 0) or 0)
+        _hash_ids = {str(i) for i in range(_num_hash)}
+        _bad = [k for k in _outgoing if (_m := _HashBiasScope.HF.value.match(k)) and _m.group(1) in _hash_ids]
+        if _bad:
+            raise AssertionError(f"[v4-adapter] hash-layer gate.bias keys leaked past filter: {_bad}")
         # ------------------------------------------------------------------
         return hf_state_dict
 
