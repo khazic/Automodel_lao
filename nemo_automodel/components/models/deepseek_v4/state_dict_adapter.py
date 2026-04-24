@@ -306,6 +306,8 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Splits stacked expert weights back to per-expert w1/w2/w3 tensors,
         applies key renaming in reverse, and optionally quantizes to FP8.
         """
+        state_dict = self._drop_hash_layer_gate_bias(state_dict)
+
         hf_state_dict: dict[str, Any] = {}
 
         for fqn, tensor in state_dict.items():
@@ -316,6 +318,27 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                 hf_state_dict[hf_key] = hf_val
 
         return hf_state_dict
+
+    def _drop_hash_layer_gate_bias(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        """The first ``num_hash_layers`` layers use hash-clustering routing and
+        their HF checkpoint has no ``ffn.gate.bias`` / ``e_score_correction_bias``
+        tensor.  The model side, however, creates the bias parameter uniformly
+        for every layer (Automodel's generic Gate always materializes it when
+        ``gate_bias_update_factor > 0``).  Drop those bias keys before load so
+        DCP does not raise ``Missing key in checkpoint state_dict`` for them.
+        """
+        num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
+        if num_hash_layers <= 0:
+            return state_dict
+        hash_layer_ids = {str(i) for i in range(num_hash_layers)}
+        bias_pat = re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.e_score_correction_bias$")
+        filtered: dict[str, Any] = {}
+        for key, value in state_dict.items():
+            m = bias_pat.match(key)
+            if m is not None and m.group(1) in hash_layer_ids:
+                continue
+            filtered[key] = value
+        return filtered
 
     # Internal -> HF name table (inverse of _HF_TO_INTERNAL_RENAMES)
     _INTERNAL_TO_HF_RENAMES: list[tuple[re.Pattern, str]] = [
