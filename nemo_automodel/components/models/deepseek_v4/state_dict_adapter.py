@@ -347,7 +347,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                     local = value.to_local().cpu() if is_dtensor(value) else value.cpu()
                     fp8_val = local.to(torch.float8_e4m3fn)
                     base = key[: -len(".weight")]
-                    scale = torch.ones(self._scale_shape(fp8_val), dtype=torch.float32)
+                    # FP8 scale is a global tensor (not sharded).  Use the global
+                    # weight shape so the placeholder matches the checkpoint scale shape
+                    # even when FSDP2 shards the weight across ranks (value.shape is
+                    # the global DTensor shape; local.shape is the per-rank shard).
+                    scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
                     quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
                 else:
