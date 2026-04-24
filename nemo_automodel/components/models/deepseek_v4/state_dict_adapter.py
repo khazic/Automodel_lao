@@ -368,17 +368,33 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         form (``model.layers.{i}.mlp.gate.e_score_correction_bias``) or the
         post-rename HF form (``layers.{i}.ffn.gate.bias``).
         """
+        import sys as _sys
+
         num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
+        print(
+            f"[v4-adapter][_drop_hash_layer_gate_bias] scope={scope.name} "
+            f"num_hash_layers={num_hash_layers} config_type={type(self.config).__name__}",
+            file=_sys.stderr,
+            flush=True,
+        )
         if num_hash_layers <= 0:
+            print("[v4-adapter][_drop_hash_layer_gate_bias] EARLY RETURN (no hash layers)", file=_sys.stderr, flush=True)
             return state_dict
         hash_layer_ids = {str(i) for i in range(num_hash_layers)}
         pat = scope.value
         filtered: dict[str, Any] = {}
+        dropped = []
         for key, value in state_dict.items():
             m = pat.match(key)
             if m is not None and m.group(1) in hash_layer_ids:
+                dropped.append(key)
                 continue
             filtered[key] = value
+        print(
+            f"[v4-adapter][_drop_hash_layer_gate_bias] scope={scope.name} dropped {len(dropped)}: {dropped}",
+            file=_sys.stderr,
+            flush=True,
+        )
         return filtered
 
     # Internal -> HF name table (inverse of _HF_TO_INTERNAL_RENAMES)
