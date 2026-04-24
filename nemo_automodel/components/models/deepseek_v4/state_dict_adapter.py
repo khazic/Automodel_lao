@@ -48,6 +48,7 @@ from typing import Any
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 
 from nemo_automodel.components.checkpoint.state_dict_adapter import StateDictAdapter
 from nemo_automodel.components.models.common import BackendConfig
@@ -341,16 +342,19 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             quantized = []
             for key, value in result:
                 if key.endswith(".weight") and not self._is_non_quantized(key):
-                    # DCP only needs correct key/dtype/shape as a loading target;
-                    # it overwrites values from disk.  Cast on CPU to avoid GPU OOM
-                    # when the model already fills device memory.
-                    local = value.to_local().cpu() if is_dtensor(value) else value.cpu()
-                    fp8_val = local.to(torch.float8_e4m3fn)
                     base = key[: -len(".weight")]
-                    # FP8 scale is a global tensor (not sharded).  Use the global
-                    # weight shape so the placeholder matches the checkpoint scale shape
-                    # even when FSDP2 shards the weight across ranks (value.shape is
-                    # the global DTensor shape; local.shape is the per-rank shard).
+                    if is_dtensor(value):
+                        # Preserve DTensor structure so DCP knows the global shape
+                        # and can shard the checkpoint load correctly.  Converting
+                        # only the local shard to a plain tensor strips the mesh /
+                        # placement metadata and causes a shape mismatch (e.g.
+                        # local [128, 4096] vs checkpoint global [512, 4096]).
+                        local_fp8 = value.to_local().to(torch.float8_e4m3fn)
+                        fp8_val = DTensor.from_local(local_fp8, value.device_mesh, value.placements)
+                    else:
+                        fp8_val = value.cpu().to(torch.float8_e4m3fn)
+                    # FP8 scale is a global (non-sharded) tensor.  Use value.shape
+                    # (global DTensor shape) so the placeholder matches the checkpoint.
                     scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
                     quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
