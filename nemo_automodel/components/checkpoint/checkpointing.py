@@ -992,8 +992,12 @@ class Checkpointer:
                         HuggingFaceStorageReader as _UpstreamHFReader,
                     )
 
-                    return _UpstreamHFReader(path=model_path)
-                except ImportError:
+                    reader = _UpstreamHFReader(path=model_path)
+                    # Verify the reader can build metadata for this checkpoint format.
+                    # Some installed PyTorch versions return None for non-standard index formats.
+                    if reader.read_metadata() is not None:
+                        return reader
+                except (ImportError, Exception):
                     pass
             return _HuggingFaceStorageReader(path=model_path, key_mapping=key_mapping)
 
