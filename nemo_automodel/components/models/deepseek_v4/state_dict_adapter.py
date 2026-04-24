@@ -341,10 +341,14 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             quantized = []
             for key, value in result:
                 if key.endswith(".weight") and not self._is_non_quantized(key):
-                    value = value.to(torch.float8_e4m3fn)
+                    # DCP only needs correct key/dtype/shape as a loading target;
+                    # it overwrites values from disk.  Cast on CPU to avoid GPU OOM
+                    # when the model already fills device memory.
+                    local = value.to_local().cpu() if is_dtensor(value) else value.cpu()
+                    fp8_val = local.to(torch.float8_e4m3fn)
                     base = key[: -len(".weight")]
-                    scale = torch.ones(self._scale_shape(value), dtype=torch.float32, device=value.device)
-                    quantized.append((key, value))
+                    scale = torch.ones(self._scale_shape(fp8_val), dtype=torch.float32)
+                    quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
                 else:
                     quantized.append((key, value))
