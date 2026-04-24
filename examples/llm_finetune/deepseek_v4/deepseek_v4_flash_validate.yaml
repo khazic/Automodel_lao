@@ -30,7 +30,9 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 seed: 1234
 
 step_scheduler:
-  global_batch_size: 2
+  # 8 GPUs with pp_size=2 -> dp_size=4; global must be a multiple of
+  # local_batch_size * dp_size = 2 * 4 = 8.
+  global_batch_size: 8
   local_batch_size: 2
   ckpt_every_steps: 1000
   val_every_steps: 5
