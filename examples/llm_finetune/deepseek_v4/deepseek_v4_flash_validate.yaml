@@ -13,9 +13,11 @@
 # limitations under the License.
 
 # Minimal validation run for DeepSeek V4 Flash — single node, 8×A100-80G.
+# Parallelism: EP=4 × PP=2 = 8 GPUs total.
+#   - 256 experts / EP=4 → 64 local experts per GPU
+#   - 43 layers / PP=2 → ~21-22 layers per pipeline stage
 # Runs 5 training steps + 1 validation step to verify loss/logits are finite.
 #
-#   CKPT=/llm-align/open_models/Deepseekv4
 #   PYTHONPATH=/llm-align/liuchonghan/Automodel_lao automodel \
 #     examples/llm_finetune/deepseek_v4/deepseek_v4_flash_validate.yaml \
 #     --nproc-per-node 8
@@ -36,11 +38,15 @@ distributed:
   strategy: fsdp2
   tp_size: 1
   cp_size: 1
-  pp_size: 1
-  ep_size: 8
+  pp_size: 2
+  ep_size: 4
 
   sequence_parallel: false
   activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: 1f1b
+    pp_microbatch_size: 1
 
   moe:
     reshard_after_forward: false
