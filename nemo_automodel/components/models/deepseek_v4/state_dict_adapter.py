@@ -314,6 +314,16 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Splits stacked expert weights back to per-expert w1/w2/w3 tensors,
         applies key renaming in reverse, and optionally quantizes to FP8.
         """
+        # --- TEMP DEBUG (remove once V4 load is green) --------------------
+        # Log every key we saw that looks like a gate bias so we can confirm
+        # the filter matches the real runtime format.
+        import logging as _logging
+
+        for _k in list(state_dict.keys()):
+            if "gate" in _k and ("bias" in _k or "e_score_correction" in _k):
+                _logging.warning("[v4-adapter] incoming gate-bias key: %s", _k)
+        # ------------------------------------------------------------------
+
         state_dict = self._drop_hash_layer_gate_bias(state_dict, _HashBiasScope.INTERNAL)
 
         hf_state_dict: dict[str, Any] = {}
@@ -329,6 +339,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         # keys in case any intermediate step emitted them in HF format directly
         # (observed in practice during DCP load even after the internal-side drop).
         hf_state_dict = self._drop_hash_layer_gate_bias(hf_state_dict, _HashBiasScope.HF)
+
+        # --- TEMP DEBUG -----------------------------------------------------
+        for _k in list(hf_state_dict.keys()):
+            if "gate" in _k and "bias" in _k:
+                _logging.warning("[v4-adapter] outgoing gate-bias key: %s", _k)
+        # ------------------------------------------------------------------
         return hf_state_dict
 
     def _drop_hash_layer_gate_bias(self, state_dict: dict[str, Any], scope: "_HashBiasScope") -> dict[str, Any]:
