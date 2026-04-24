@@ -28,9 +28,9 @@ Key mapping (HF -> internal):
   layers.{i}.ffn.gate.weight            -> model.layers.{i}.mlp.gate.weight
   layers.{i}.ffn.gate.bias             -> model.layers.{i}.mlp.gate.e_score_correction_bias
   layers.{i}.ffn.gate.tid2eid          -> model.layers.{i}.mlp.gate.tid2eid  (hash layers only)
-  layers.{i}.ffn.shared_experts.w1.*   -> model.layers.{i}.mlp.shared_expert.gate_proj.*
-  layers.{i}.ffn.shared_experts.w3.*   -> model.layers.{i}.mlp.shared_expert.up_proj.*
-  layers.{i}.ffn.shared_experts.w2.*   -> model.layers.{i}.mlp.shared_expert.down_proj.*
+  layers.{i}.ffn.shared_experts.w1.*   -> model.layers.{i}.mlp.shared_experts.gate_proj.*
+  layers.{i}.ffn.shared_experts.w3.*   -> model.layers.{i}.mlp.shared_experts.up_proj.*
+  layers.{i}.ffn.shared_experts.w2.*   -> model.layers.{i}.mlp.shared_experts.down_proj.*
   layers.{i}.ffn.experts.{j}.w1.weight -> aggregated into model.layers.{i}.mlp.experts.gate_and_up_projs
   layers.{i}.ffn.experts.{j}.w3.weight -> aggregated into model.layers.{i}.mlp.experts.gate_and_up_projs
   layers.{i}.ffn.experts.{j}.w2.weight -> aggregated into model.layers.{i}.mlp.experts.down_projs
@@ -101,15 +101,15 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     # Shared expert (w1=gate, w3=up, w2=down)
     (
         re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.(.+)$"),
-        r"model.layers.\1.mlp.shared_expert.gate_proj.\2",
+        r"model.layers.\1.mlp.shared_experts.gate_proj.\2",
     ),
     (
         re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w3\.(.+)$"),
-        r"model.layers.\1.mlp.shared_expert.up_proj.\2",
+        r"model.layers.\1.mlp.shared_experts.up_proj.\2",
     ),
     (
         re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.(.+)$"),
-        r"model.layers.\1.mlp.shared_expert.down_proj.\2",
+        r"model.layers.\1.mlp.shared_experts.down_proj.\2",
     ),
     # Latent projections (fc1: hidden→latent, fc2: latent→hidden)
     (
@@ -401,15 +401,15 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         ),
         (re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.(.+)$"), r"layers.\1.ffn.gate.\2"),
         (
-            re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_expert\.gate_proj\.(.+)$"),
+            re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.gate_proj\.(.+)$"),
             r"layers.\1.ffn.shared_experts.w1.\2",
         ),
         (
-            re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_expert\.up_proj\.(.+)$"),
+            re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.up_proj\.(.+)$"),
             r"layers.\1.ffn.shared_experts.w3.\2",
         ),
         (
-            re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_expert\.down_proj\.(.+)$"),
+            re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.down_proj\.(.+)$"),
             r"layers.\1.ffn.shared_experts.w2.\2",
         ),
         (
