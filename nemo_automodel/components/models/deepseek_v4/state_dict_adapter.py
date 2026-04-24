@@ -67,6 +67,11 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
 )
 
+# V4 routed-expert weights use per-row quantization with 32-column groups.
+# Scale shape: [weight_rows, ceil(weight_cols / EXPERT_COL_BLOCK)]
+# Non-expert weights use the standard BLOCK_SIZE x BLOCK_SIZE (128x128) format.
+EXPERT_COL_BLOCK = 32
+
 # HF V4 key -> internal key  (simple renames; expert & FP8 handled separately)
 _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     # Top-level
@@ -166,7 +171,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
 
             if scale_key is not None:
                 scale = state_dict[scale_key]
-                state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
+                if self._is_expert_weight_key(key):
+                    # Routed expert weights use per-row / 32-col-group quantization.
+                    state_dict[key] = self._dequantize_expert_fp8(weight, scale, self.dtype)
+                else:
+                    state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
                 scale_keys_to_remove.append(scale_key)
 
         for k in scale_keys_to_remove:
@@ -355,7 +364,11 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                         fp8_val = value.cpu().to(torch.float8_e4m3fn)
                     # FP8 scale is a global (non-sharded) tensor.  Use value.shape
                     # (global DTensor shape) so the placeholder matches the checkpoint.
-                    scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
+                    # Expert weights use per-row / 32-col-group scales (finer granularity).
+                    if self._is_expert_weight_key(key):
+                        scale = torch.ones(self._expert_scale_shape(value), dtype=torch.float32)
+                    else:
+                        scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
                     quantized.append((key, fp8_val))
                     quantized.append((base + ".scale", scale))
                 else:
@@ -381,9 +394,32 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
     def _is_non_quantized(self, hf_key: str) -> bool:
         return any(pat in hf_key for pat in self._NON_QUANTIZED_PATTERNS)
 
+    @staticmethod
+    def _is_expert_weight_key(key: str) -> bool:
+        return "ffn.experts." in key
+
     def _scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
         r, c = weight.shape
         return ((r + BLOCK_SIZE - 1) // BLOCK_SIZE, (c + BLOCK_SIZE - 1) // BLOCK_SIZE)
+
+    def _expert_scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
+        r, c = weight.shape
+        return (r, (c + EXPERT_COL_BLOCK - 1) // EXPERT_COL_BLOCK)
+
+    @staticmethod
+    def _dequantize_expert_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Dequantize V4 routed-expert FP8 weights.
+
+        V4 experts use per-row / 32-column-group quantization:
+          scale shape: [weight_rows, ceil(weight_cols / EXPERT_COL_BLOCK)]
+          Each scale[i, j] covers weight[i, j*32 : (j+1)*32].
+        """
+        weight_local = weight.to_local() if is_dtensor(weight) else weight
+        scale_local = scale.to_local() if is_dtensor(scale) else scale
+        weight_f32 = weight_local.to(torch.float32)
+        # Expand scale to full column width by repeating each column-group scale.
+        scale_expanded = scale_local.repeat_interleave(EXPERT_COL_BLOCK, dim=1)[:, : weight_f32.shape[1]]
+        return (weight_f32 * scale_expanded).to(dtype)
 
     def _split_merged_expert(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
         """Inverse of expert aggregation: split gate_and_up/down stacks into per-expert keys.
