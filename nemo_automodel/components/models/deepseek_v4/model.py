@@ -249,6 +249,7 @@ class DeepseekV4Model(nn.Module):
             route_scale=config.routed_scaling_factor,
             aux_loss_coeff=0,
             norm_topk_prob=config.norm_topk_prob,
+            dtype=get_dtype(config.torch_dtype, torch.bfloat16),
         )
         if moe_overrides:
             moe_defaults.update(moe_overrides)
