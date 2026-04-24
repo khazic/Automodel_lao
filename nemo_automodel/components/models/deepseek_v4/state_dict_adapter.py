@@ -99,6 +99,15 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
         re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w2\.(.+)$"),
         r"model.layers.\1.mlp.shared_expert.down_proj.\2",
     ),
+    # Latent projections (fc1: hidden→latent, fc2: latent→hidden)
+    (
+        re.compile(r"^layers\.(\d+)\.ffn\.fc1_latent_proj\.(.+)$"),
+        r"model.layers.\1.mlp.fc1_latent_proj.\2",
+    ),
+    (
+        re.compile(r"^layers\.(\d+)\.ffn\.fc2_latent_proj\.(.+)$"),
+        r"model.layers.\1.mlp.fc2_latent_proj.\2",
+    ),
     # HC (hash-clustering) parameters
     (re.compile(r"^layers\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))$"), r"model.layers.\1.\2"),
 ]
@@ -324,6 +333,14 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_expert\.down_proj\.(.+)$"),
             r"layers.\1.ffn.shared_experts.w2.\2",
         ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.mlp\.fc1_latent_proj\.(.+)$"),
+            r"layers.\1.ffn.fc1_latent_proj.\2",
+        ),
+        (
+            re.compile(r"^model\.layers\.(\d+)\.mlp\.fc2_latent_proj\.(.+)$"),
+            r"layers.\1.ffn.fc2_latent_proj.\2",
+        ),
         (re.compile(r"^model\.layers\.(\d+)\.(hc_(?:attn|ffn)_(?:base|fn|scale))$"), r"layers.\1.\2"),
     ]
 
@@ -389,6 +406,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         "attn.q_norm.weight",
         "attn.kv_norm.weight",
         "attn.attn_sink",
+        # Latent projections are stored as BF16 in the V4 checkpoint (not FP8).
+        "ffn.fc1_latent_proj.weight",
+        "ffn.fc2_latent_proj.weight",
     ]
 
     def _is_non_quantized(self, hf_key: str) -> bool:

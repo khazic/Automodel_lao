@@ -242,6 +242,12 @@ class DeepseekV4Model(nn.Module):
             dim=config.hidden_size,
             inter_dim=config.moe_intermediate_size,
             moe_inter_dim=config.moe_intermediate_size,
+            # V4 routed experts operate in a compressed latent space of size
+            # moe_intermediate_size (not the full hidden_size).  This enables the
+            # MoE module to create fc1_latent_proj [hidden→latent] and
+            # fc2_latent_proj [latent→hidden] and sets expert_dim=moe_latent_size,
+            # giving expert weight shapes [moe_inter_dim, moe_latent_size] (= [2048,2048]).
+            moe_latent_size=config.moe_intermediate_size,
             n_routed_experts=config.n_routed_experts,
             n_shared_experts=config.n_shared_experts,
             n_activated_experts=config.num_experts_per_tok,
