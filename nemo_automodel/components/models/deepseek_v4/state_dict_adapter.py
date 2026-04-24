@@ -25,6 +25,9 @@ Key mapping (HF -> internal):
   layers.{i}.attn_norm.weight           -> model.layers.{i}.input_layernorm.weight
   layers.{i}.ffn_norm.weight            -> model.layers.{i}.post_attention_layernorm.weight
   layers.{i}.attn.*                     -> model.layers.{i}.self_attn.*
+  layers.{i}.ffn.gate.weight            -> model.layers.{i}.mlp.gate.weight
+  layers.{i}.ffn.gate.bias             -> model.layers.{i}.mlp.gate.e_score_correction_bias
+  layers.{i}.ffn.gate.tid2eid          -> model.layers.{i}.mlp.gate.tid2eid  (hash layers only)
   layers.{i}.ffn.shared_experts.w1.*   -> model.layers.{i}.mlp.shared_expert.gate_proj.*
   layers.{i}.ffn.shared_experts.w3.*   -> model.layers.{i}.mlp.shared_expert.up_proj.*
   layers.{i}.ffn.shared_experts.w2.*   -> model.layers.{i}.mlp.shared_expert.down_proj.*
@@ -73,6 +76,9 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^layers\.(\d+)\.ffn_norm\.(.+)$"), r"model.layers.\1.post_attention_layernorm.\2"),
     # Attention sub-keys
     (re.compile(r"^layers\.(\d+)\.attn\.(.+)$"), r"model.layers.\1.self_attn.\2"),
+    # MoE gate (score weight + optional bias correction + hash table)
+    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$"), r"model.layers.\1.mlp.gate.e_score_correction_bias"),
+    (re.compile(r"^layers\.(\d+)\.ffn\.gate\.(.+)$"), r"model.layers.\1.mlp.gate.\2"),
     # Shared expert (w1=gate, w3=up, w2=down)
     (
         re.compile(r"^layers\.(\d+)\.ffn\.shared_experts\.w1\.(.+)$"),
@@ -144,6 +150,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         scale_keys_to_remove: list[str] = []
         for key in list(state_dict.keys()):
             weight = state_dict[key]
+            # tid2eid is int32 — skip dequantization entirely
+            if key.endswith(".tid2eid"):
+                continue
             # HF V4 uses `<base>.scale`; V3 used `<base>.weight_scale_inv`
             scale_key = None
             if key.endswith(".weight"):
@@ -286,6 +295,12 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         (re.compile(r"^model\.layers\.(\d+)\.input_layernorm\.(.+)$"), r"layers.\1.attn_norm.\2"),
         (re.compile(r"^model\.layers\.(\d+)\.post_attention_layernorm\.(.+)$"), r"layers.\1.ffn_norm.\2"),
         (re.compile(r"^model\.layers\.(\d+)\.self_attn\.(.+)$"), r"layers.\1.attn.\2"),
+        # Gate (bias correction key mapped back to `bias`)
+        (
+            re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.e_score_correction_bias$"),
+            r"layers.\1.ffn.gate.bias",
+        ),
+        (re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.(.+)$"), r"layers.\1.ffn.gate.\2"),
         (
             re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_expert\.gate_proj\.(.+)$"),
             r"layers.\1.ffn.shared_experts.w1.\2",
@@ -343,6 +358,8 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         "head.weight",
         "embed.weight",
         "ffn.gate.weight",
+        "ffn.gate.bias",
+        "ffn.gate.tid2eid",
         "attn.q_norm.weight",
         "attn.kv_norm.weight",
         "attn.attn_sink",
@@ -370,8 +387,9 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             for eid in range(n):
                 t = tensor[eid]  # [hidden_dim, 2*inter_dim]
                 gate_t, up_t = t.split(inter_dim, dim=-1)
-                result.append((f"model.layers.{layer_num}.mlp.experts.{eid}.gate_proj.weight", gate_t.T))
-                result.append((f"model.layers.{layer_num}.mlp.experts.{eid}.up_proj.weight", up_t.T))
+                # V4 HF uses w1 (gate) and w3 (up)
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w1.weight", gate_t.T))
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w3.weight", up_t.T))
             return result
 
         m = down_pat.match(fqn)
@@ -380,7 +398,8 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             # tensor: [n_experts, inter_dim, hidden_dim] (stacked, transposed)
             result = []
             for eid in range(tensor.shape[0]):
-                result.append((f"model.layers.{layer_num}.mlp.experts.{eid}.down_proj.weight", tensor[eid].T))
+                # V4 HF uses w2 (down)
+                result.append((f"layers.{layer_num}.ffn.experts.{eid}.w2.weight", tensor[eid].T))
             return result
 
         return [(fqn, tensor)]
