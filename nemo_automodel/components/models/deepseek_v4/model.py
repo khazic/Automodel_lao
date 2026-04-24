@@ -119,9 +119,11 @@ class DeepseekV4Block(nn.Module):
         )
 
         # HC parameters — present in ALL layers, stored as float32.
+        # requires_grad=False: full HC forward (hc_split_sinkhorn) not yet implemented;
+        # params are registered for checkpoint compatibility but not in the autograd graph.
         shapes = _hc_param_shape(config.hc_mult, config.hidden_size)
         for name, shape in shapes.items():
-            self.register_parameter(name, nn.Parameter(torch.zeros(shape, dtype=torch.float32)))
+            self.register_parameter(name, nn.Parameter(torch.zeros(shape, dtype=torch.float32), requires_grad=False))
 
     def forward(
         self,

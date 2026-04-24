@@ -234,9 +234,10 @@ class DeepseekV4Attention(nn.Module):
 
         # Attention sink: per-head learnable scalar (stored in float32 per official impl)
         # Shape: [n_heads] — broadcast over the sink position in sparse_attn.
+        # requires_grad=False: sliding-window attn (where sink is used) not yet implemented.
         self.register_parameter(
             "attn_sink",
-            nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32)),
+            nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32), requires_grad=False),
         )
 
         # Softmax scale with YaRN correction (V4 rope_scaling uses type="yarn" without explicit mscale)

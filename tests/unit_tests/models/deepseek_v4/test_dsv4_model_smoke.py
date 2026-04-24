@@ -83,6 +83,12 @@ def _make_model(config: DeepseekV4Config) -> DeepseekV4ForCausalLM:
         experts="torch_mm",
     )
     model = DeepseekV4ForCausalLM(config, backend=backend)
+    # Zero all float params: Gate/GroupedExperts use torch.empty (uninitialized memory
+    # that may contain NaN bit patterns). initialize_weights() is not called in smoke tests.
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.is_floating_point():
+                p.zero_()
     model.eval()
     return model
 
