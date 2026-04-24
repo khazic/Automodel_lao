@@ -73,6 +73,34 @@ from nemo_automodel.components.models.deepseek_v3.rope_utils import (
 from nemo_automodel.components.models.deepseek_v4.config import DeepseekV4Config
 from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
+# FP8 KV QAT: fake-quantize K,V to e4m3 with straight-through gradient.
+# Enabled by env var V4_FP8_KV_QAT=1 so we can A/B against plain bf16 KV.
+import os as _os
+
+_V4_FP8_KV_QAT = _os.environ.get("V4_FP8_KV_QAT", "0") == "1"
+
+
+class _STEFp8Cast(torch.autograd.Function):
+    """Straight-through estimator for fp8 e4m3 fake-quant cast."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        # e4m3 max ~448; scale so the max abs value sits near the representable
+        # range to minimize clipping.  Per-tensor scale keeps this cheap.
+        amax = x.detach().abs().amax().clamp(min=1e-4)
+        scale = (448.0 / amax).to(torch.float32)
+        y = (x.float() * scale).to(torch.float8_e4m3fn).to(torch.float32) / scale
+        return y.to(orig_dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output
+
+
+def _fp8_qat(x: torch.Tensor) -> torch.Tensor:
+    return _STEFp8Cast.apply(x)
+
 # ---------------------------------------------------------------------------
 # Grouped output projection (wo_a)
 # ---------------------------------------------------------------------------
@@ -313,6 +341,12 @@ class DeepseekV4Attention(nn.Module):
 
         q = torch.cat([q_nope, q_pe], dim=-1)
         kv = torch.cat([kv_nope, kv_pe], dim=-1)
+
+        # Optional FP8 KV QAT: fake-quantize the single KV latent to e4m3 with a
+        # straight-through gradient.  The reference V4 runs attention with FP8
+        # KV cache; quantizing here matches the inference-time K/V distribution.
+        if _V4_FP8_KV_QAT:
+            kv = _fp8_qat(kv)
 
         # Expand kv to n_heads (K=V shared across all heads) for standard attention path
         if qkv_format == "thd":
