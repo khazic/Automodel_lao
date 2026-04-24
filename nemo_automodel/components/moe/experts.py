@@ -237,13 +237,13 @@ class GroupedExperts(nn.Module):
         )
 
         self.down_projs = nn.Parameter(
-            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.expert_dim, dtype=config.dtype)
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.expert_dim_out, dtype=config.dtype)
         )
 
         if self.expert_bias:
             self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, up_proj_dim, dtype=config.dtype))
             self.down_proj_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, config.expert_dim, dtype=config.dtype)
+                torch.empty(config.n_routed_experts, config.expert_dim_out, dtype=config.dtype)
             )
         else:
             self.gate_up_proj_bias = None
@@ -613,11 +613,13 @@ class GroupedExpertsDeepEP(nn.Module):
         up_proj_dim = config.moe_inter_dim * 2 if self.is_gated else config.moe_inter_dim
         self.gate_and_up_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim, up_proj_dim))
 
-        self.down_projs = nn.Parameter(torch.empty(config.n_routed_experts, config.moe_inter_dim, config.expert_dim))
+        self.down_projs = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.moe_inter_dim, config.expert_dim_out)
+        )
 
         if self.expert_bias:
             self.gate_up_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, up_proj_dim))
-            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim))
+            self.down_proj_bias = nn.Parameter(torch.empty(config.n_routed_experts, config.expert_dim_out))
         else:
             self.gate_up_proj_bias = None
             self.down_proj_bias = None
@@ -832,11 +834,11 @@ class GroupedExpertsTE(nn.Module):
             params_dtype=config.dtype,
             device="meta",
         )
-        # down_linear: [moe_inter_dim] -> [dim]
+        # down_linear: [moe_inter_dim] -> [expert_dim_out]
         self.down_linear = GroupedLinear(
             num_gemms=config.n_routed_experts,
             in_features=config.moe_inter_dim,
-            out_features=config.expert_dim,
+            out_features=config.expert_dim_out,
             bias=self.expert_bias,
             params_dtype=config.dtype,
             device="meta",

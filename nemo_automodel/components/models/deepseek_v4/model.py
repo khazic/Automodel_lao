@@ -248,6 +248,9 @@ class DeepseekV4Model(nn.Module):
             # fc2_latent_proj [latent→hidden] and sets expert_dim=moe_latent_size,
             # giving expert weight shapes [moe_inter_dim, moe_latent_size] (= [2048,2048]).
             moe_latent_size=config.moe_intermediate_size,
+            # V4 Flash expert down projection (w2) outputs hidden_size directly,
+            # so no fc2_latent_proj is needed after the expert computation.
+            expert_out_dim=config.hidden_size,
             n_routed_experts=config.n_routed_experts,
             n_shared_experts=config.n_shared_experts,
             n_activated_experts=config.num_experts_per_tok,

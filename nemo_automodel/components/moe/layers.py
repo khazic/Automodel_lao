@@ -625,14 +625,19 @@ class MoE(nn.Module):
             self.shared_experts = None
             self.shared_expert_gate = None
 
-        # When enabled, input is projected to latent space before MoE and back after
+        # When enabled, input is projected to latent space before routing.
+        # fc2_latent_proj is only needed when the expert down projection does NOT
+        # already output config.dim (i.e. expert_out_dim is None or < dim).
         if config.moe_latent_size is not None:
             self.fc1_latent_proj = initialize_linear_module(
                 backend.linear, config.dim, config.moe_latent_size, bias=config.expert_bias, dtype=config.dtype
             )
-            self.fc2_latent_proj = initialize_linear_module(
-                backend.linear, config.moe_latent_size, config.dim, bias=config.expert_bias, dtype=config.dtype
-            )
+            if config.expert_out_dim is None:
+                self.fc2_latent_proj = initialize_linear_module(
+                    backend.linear, config.moe_latent_size, config.dim, bias=config.expert_bias, dtype=config.dtype
+                )
+            else:
+                self.fc2_latent_proj = None
         else:
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None

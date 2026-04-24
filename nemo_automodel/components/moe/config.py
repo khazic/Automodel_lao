@@ -65,11 +65,20 @@ class MoEConfig:
     shared_expert_activation: str = "swiglu"  # Activation for shared experts ("swiglu" or "relu2")
     force_e_score_correction_bias: bool = False  # Force creation of e_score_correction_bias buffer
     moe_latent_size: int | None = None
+    # When set, the down projection outputs this dimension instead of expert_dim.
+    # Enables asymmetric expert design (e.g. V4 Flash: gate/up take latent=2048-dim
+    # input while down projects directly to hidden=4096-dim, no fc2_latent_proj needed).
+    expert_out_dim: int | None = None
 
     @property
     def expert_dim(self) -> int:
-        """Dimension used for expert projections (latent size when set, otherwise model dim)."""
+        """Dimension used for expert gate/up projections (latent size when set, else model dim)."""
         return self.moe_latent_size if self.moe_latent_size is not None else self.dim
+
+    @property
+    def expert_dim_out(self) -> int:
+        """Dimension produced by the expert down projection."""
+        return self.expert_out_dim if self.expert_out_dim is not None else self.expert_dim
 
     def __post_init__(self):
         if isinstance(self.dtype, str):

@@ -67,10 +67,19 @@ from nemo_automodel.components.moe.state_dict_utils import (
     should_load_expert_for_rank,
 )
 
-# V4 routed-expert weights use per-row quantization with 16-column groups.
-# Scale shape: [weight_rows, ceil(weight_cols / EXPERT_COL_BLOCK)]
-# Non-expert weights use the standard BLOCK_SIZE x BLOCK_SIZE (128x128) format.
-EXPERT_COL_BLOCK = 16
+# V4 routed-expert weights use per-row FP8 quantization with different column
+# group sizes for gate/up (w1/w3) vs down (w2) projections:
+#   w1, w3 (gate/up): 16-col groups  → scale [rows, ceil(cols/16)]
+#   w2     (down):    32-col groups  → scale [rows, ceil(cols/32)]
+# Non-expert weights use the standard BLOCK_SIZE×BLOCK_SIZE (128×128) format.
+EXPERT_COL_BLOCK_GATE_UP = 16
+EXPERT_COL_BLOCK_DOWN = 32
+
+
+def _expert_col_block(key: str) -> int:
+    """Return the FP8 column-group block size for a routed expert weight key."""
+    return EXPERT_COL_BLOCK_DOWN if ".w2." in key else EXPERT_COL_BLOCK_GATE_UP
+
 
 # HF V4 key -> internal key  (simple renames; expert & FP8 handled separately)
 _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
@@ -181,8 +190,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             if scale_key is not None:
                 scale = state_dict[scale_key]
                 if self._is_expert_weight_key(key):
-                    # Routed expert weights use per-row / 32-col-group quantization.
-                    state_dict[key] = self._dequantize_expert_fp8(weight, scale, self.dtype)
+                    state_dict[key] = self._dequantize_expert_fp8(weight, scale, self.dtype, key)
                 else:
                     state_dict[key] = dequantize_from_fp8(weight, scale, dtype=self.dtype, name=key)
                 scale_keys_to_remove.append(scale_key)
@@ -383,7 +391,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
                     # (global DTensor shape) so the placeholder matches the checkpoint.
                     # Expert weights use per-row / 32-col-group scales (finer granularity).
                     if self._is_expert_weight_key(key):
-                        scale = torch.ones(self._expert_scale_shape(value), dtype=torch.float32)
+                        scale = torch.ones(self._expert_scale_shape(value, key), dtype=torch.float32)
                     else:
                         scale = torch.ones(self._scale_shape(value), dtype=torch.float32)
                     quantized.append((key, fp8_val))
@@ -422,23 +430,23 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         r, c = weight.shape
         return ((r + BLOCK_SIZE - 1) // BLOCK_SIZE, (c + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
-    def _expert_scale_shape(self, weight: torch.Tensor) -> tuple[int, int]:
+    def _expert_scale_shape(self, weight: torch.Tensor, key: str) -> tuple[int, int]:
         r, c = weight.shape
-        return (r, (c + EXPERT_COL_BLOCK - 1) // EXPERT_COL_BLOCK)
+        block = _expert_col_block(key)
+        return (r, (c + block - 1) // block)
 
     @staticmethod
-    def _dequantize_expert_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def _dequantize_expert_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, key: str) -> torch.Tensor:
         """Dequantize V4 routed-expert FP8 weights.
 
-        V4 experts use per-row / 32-column-group quantization:
-          scale shape: [weight_rows, ceil(weight_cols / EXPERT_COL_BLOCK)]
-          Each scale[i, j] covers weight[i, j*32 : (j+1)*32].
+        w1/w3 (gate/up): 16-col groups — scale[i,j] covers weight[i, j*16:(j+1)*16]
+        w2    (down):    32-col groups — scale[i,j] covers weight[i, j*32:(j+1)*32]
         """
+        block = _expert_col_block(key)
         weight_local = weight.to_local() if is_dtensor(weight) else weight
         scale_local = scale.to_local() if is_dtensor(scale) else scale
         weight_f32 = weight_local.to(torch.float32)
-        # Expand scale to full column width by repeating each column-group scale.
-        scale_expanded = scale_local.repeat_interleave(EXPERT_COL_BLOCK, dim=1)[:, : weight_f32.shape[1]]
+        scale_expanded = scale_local.repeat_interleave(block, dim=1)[:, : weight_f32.shape[1]]
         return (weight_f32 * scale_expanded).to(dtype)
 
     def _split_merged_expert(self, fqn: str, tensor: Any) -> list[tuple[str, Any]]:
