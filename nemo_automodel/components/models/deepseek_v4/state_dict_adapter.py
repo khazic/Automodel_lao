@@ -43,6 +43,7 @@ Both suffixes are handled by the dequantization step.
 
 from __future__ import annotations
 
+import enum
 import re
 from typing import Any
 
@@ -125,6 +126,13 @@ _HF_TO_INTERNAL_RENAMES: list[tuple[re.Pattern, str]] = [
 
 # Routed-expert pattern in HF V4 format
 _EXPERT_PATTERN = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w1|w2|w3)\.weight$")
+
+
+class _HashBiasScope(enum.Enum):
+    """Key-format scope for :meth:`DeepSeekV4StateDictAdapter._drop_hash_layer_gate_bias`."""
+
+    INTERNAL = re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.e_score_correction_bias$")
+    HF = re.compile(r"^layers\.(\d+)\.ffn\.gate\.bias$")
 
 
 def _rename_hf_key(key: str) -> str:
@@ -306,7 +314,7 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
         Splits stacked expert weights back to per-expert w1/w2/w3 tensors,
         applies key renaming in reverse, and optionally quantizes to FP8.
         """
-        state_dict = self._drop_hash_layer_gate_bias(state_dict)
+        state_dict = self._drop_hash_layer_gate_bias(state_dict, _HashBiasScope.INTERNAL)
 
         hf_state_dict: dict[str, Any] = {}
 
@@ -317,24 +325,32 @@ class DeepSeekV4StateDictAdapter(StateDictAdapter):
             for hf_key, hf_val in converted:
                 hf_state_dict[hf_key] = hf_val
 
+        # Belt-and-suspenders: re-run the hash-layer bias filter on the HF-side
+        # keys in case any intermediate step emitted them in HF format directly
+        # (observed in practice during DCP load even after the internal-side drop).
+        hf_state_dict = self._drop_hash_layer_gate_bias(hf_state_dict, _HashBiasScope.HF)
         return hf_state_dict
 
-    def _drop_hash_layer_gate_bias(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def _drop_hash_layer_gate_bias(self, state_dict: dict[str, Any], scope: "_HashBiasScope") -> dict[str, Any]:
         """The first ``num_hash_layers`` layers use hash-clustering routing and
         their HF checkpoint has no ``ffn.gate.bias`` / ``e_score_correction_bias``
         tensor.  The model side, however, creates the bias parameter uniformly
         for every layer (Automodel's generic Gate always materializes it when
         ``gate_bias_update_factor > 0``).  Drop those bias keys before load so
         DCP does not raise ``Missing key in checkpoint state_dict`` for them.
+
+        ``scope`` selects which key format to match — the pre-rename internal
+        form (``model.layers.{i}.mlp.gate.e_score_correction_bias``) or the
+        post-rename HF form (``layers.{i}.ffn.gate.bias``).
         """
         num_hash_layers = int(getattr(self.config, "num_hash_layers", 0) or 0)
         if num_hash_layers <= 0:
             return state_dict
         hash_layer_ids = {str(i) for i in range(num_hash_layers)}
-        bias_pat = re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.e_score_correction_bias$")
+        pat = scope.value
         filtered: dict[str, Any] = {}
         for key, value in state_dict.items():
-            m = bias_pat.match(key)
+            m = pat.match(key)
             if m is not None and m.group(1) in hash_layer_ids:
                 continue
             filtered[key] = value
