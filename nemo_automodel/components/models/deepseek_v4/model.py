@@ -246,7 +246,7 @@ class DeepseekV4Model(nn.Module):
             # moe_intermediate_size (not the full hidden_size).  This enables the
             # MoE module to create fc1_latent_proj [hidden→latent] and
             # fc2_latent_proj [latent→hidden] and sets expert_dim=moe_latent_size,
-            # giving expert weight shapes [moe_inter_dim, moe_latent_size] (= [2048,2048]).
+            # giving expert weight shapes [moe_inter_dim, moe_latent_size] (= [1024,1024]).
             moe_latent_size=config.moe_intermediate_size,
             # V4 Flash expert down projection (w2) outputs hidden_size directly,
             # so no fc2_latent_proj is needed after the expert computation.

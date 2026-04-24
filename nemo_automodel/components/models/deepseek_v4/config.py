@@ -37,7 +37,7 @@ class DeepseekV4Config(PretrainedConfig):
         self,
         vocab_size: int = 129280,
         hidden_size: int = 4096,
-        moe_intermediate_size: int = 2048,
+        moe_intermediate_size: int = 1024,
         num_hidden_layers: int = 43,
         num_attention_heads: int = 64,
         num_key_value_heads: int = 1,
