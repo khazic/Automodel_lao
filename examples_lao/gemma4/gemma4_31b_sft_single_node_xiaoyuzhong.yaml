@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Gemma 4 31B Full-Parameter SFT — single-node 8xGPU, 4 combined parquet datasets.
+# Gemma 4 31B Full-Parameter SFT — single-node 8xGPU, xiaoyuzhong parquet datasets.
 #
 # Launch:
-#   torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py -c examples_lao/gemma4/gemma4_31b_sft_single_node_combined.yaml
+#   torchrun --nproc-per-node=8 nemo_automodel/recipes/vlm/finetune.py -c examples_lao/gemma4/gemma4_31b_sft_single_node_xiaoyuzhong.yaml
 
 recipe: FinetuneRecipeForVLM
 
@@ -47,7 +47,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_combined/
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0428/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -65,10 +65,19 @@ loss_fn:
 dataset:
   _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:make_parquet_messages_dataset
   path_or_dataset:
-    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dayuzhong_instruct_gemini3.1_5w.parquet
-    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dyz_trans_10w_gemini3.1.parquet
-    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/filtered_chat.parquet
-    - /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/trans_terms_for_train_data.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-001-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-002-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-003-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-004-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-005-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-006-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-007-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-008-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-009-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-010-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-011-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/trans_multi2multi_110w_gemini25_claude_only_messages.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/zangyu_165039.parquet
   split: train
   shuffle_seed: 42
 
@@ -98,4 +107,4 @@ freeze_config:
 # wandb:
 #   project: <your-project>
 #   entity: <your-entity>
-#   name: gemma4-31b-sft-combined
+#   name: gemma4-31b-sft-xiaoyuzhong
