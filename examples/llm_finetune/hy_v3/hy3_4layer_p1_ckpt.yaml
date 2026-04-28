@@ -72,7 +72,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /tmp/checkpoints/hy3_p1/
+  checkpoint_dir: /llm-align/liuchonghan/checkpoints/hy3_p1/
   model_save_format: safetensors
   save_consolidated: false
 
