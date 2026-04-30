@@ -1,9 +1,9 @@
 #!/bin/bash
-# Install required Python packages into the system Python environment.
-# Run once on a fresh server before launching any training job.
+# Install required Python packages into the system Python environment
+# and set PYTHONPATH for the current shell session.
 #
-# Usage:
-#   bash examples_lao/gemma4/setup_system_env.sh
+# Usage (source so PYTHONPATH takes effect in your current shell):
+#   source examples_lao/gemma4/setup_system_env.sh
 
 set -euo pipefail
 
@@ -28,3 +28,7 @@ $PIP \
     "opencv-python-headless==4.10.0.84"
 
 echo "==> Done. All packages installed."
+
+REPO_ROOT=/llm-align/liuchonghan/Automodel_lao
+export PYTHONPATH=${REPO_ROOT}:${PYTHONPATH:-}
+echo "==> PYTHONPATH set to: ${PYTHONPATH}"
