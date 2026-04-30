@@ -22,7 +22,7 @@ recipe: FinetuneRecipeForVLM
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 4000
+  ckpt_every_steps: 10000
   val_every_steps: null
   num_epochs: 1
 
