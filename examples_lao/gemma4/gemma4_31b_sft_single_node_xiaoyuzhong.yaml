@@ -47,7 +47,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0428/
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0430/
   model_save_format: safetensors
   save_consolidated: false
 
