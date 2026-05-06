@@ -36,6 +36,29 @@ def _as_list(path_or_dataset: str | Sequence[str]) -> list[str]:
     return [str(x) for x in path_or_dataset]
 
 
+def _has_valid_messages(example: dict) -> bool:
+    """Return False for samples that have any assistant turn with empty content."""
+    messages = example.get("messages")
+    if not isinstance(messages, list):
+        return False
+    has_user = False
+    has_assistant = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content", "")
+        if content is None:
+            content = ""
+        if role == "assistant":
+            if str(content).strip() == "":
+                return False
+            has_assistant = True
+        elif role == "user":
+            has_user = True
+    return has_user and has_assistant
+
+
 def _to_conversation(example: dict) -> dict:
     messages = example.get("messages")
     if not isinstance(messages, list):
@@ -90,6 +113,7 @@ def make_parquet_messages_dataset(
         raise FileNotFoundError(f"Missing parquet file(s): {missing}")
 
     dataset = load_dataset("parquet", data_files=data_files, split=split)
+    dataset = dataset.filter(_has_valid_messages)
 
     if shuffle_seed is not None:
         dataset = dataset.shuffle(seed=shuffle_seed)
