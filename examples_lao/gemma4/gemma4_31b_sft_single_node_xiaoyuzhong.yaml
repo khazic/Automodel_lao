@@ -47,7 +47,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0430/
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0506/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -87,7 +87,7 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:gemma4_prefix_truncating_collate_fn
-    max_length: 2048
+    max_length: 4096
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -99,7 +99,7 @@ lr_scheduler:
   lr_decay_style: cosine
 
 freeze_config:
-  freeze_embeddings: true
+  freeze_embeddings: false
   freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
