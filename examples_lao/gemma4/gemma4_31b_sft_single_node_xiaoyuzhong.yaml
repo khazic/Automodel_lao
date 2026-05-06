@@ -20,7 +20,7 @@
 recipe: FinetuneRecipeForVLM
 
 step_scheduler:
-  global_batch_size: 8
+  global_batch_size: 32
   local_batch_size: 1
   ckpt_every_steps: 10000
   val_every_steps: null
@@ -47,7 +47,7 @@ model:
 
 checkpoint:
   enabled: true
-  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0506/
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/gemma4_31b_sft_xiaoyuzhong_0506_v2/
   model_save_format: safetensors
   save_consolidated: false
 
@@ -87,11 +87,11 @@ dataloader:
   pin_memory: true
   collate_fn:
     _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/gemma4/parquet_messages_dataset.py:gemma4_prefix_truncating_collate_fn
-    max_length: 4096
+    max_length: 1024
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 5e-6
+  lr: 1e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
 
