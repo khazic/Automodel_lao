@@ -77,6 +77,7 @@ dataset:
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-010-of-011.parquet
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-011-of-011.parquet
     - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/trans_multi2multi_110w_gemini25_claude_only_messages.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/zangyu_165039.parquet
   split: train
   shuffle_seed: 42
 
