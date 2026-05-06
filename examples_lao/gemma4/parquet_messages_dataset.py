@@ -146,9 +146,12 @@ def gemma4_prefix_truncating_collate_fn(
     original_truncation_side = getattr(tokenizer, "truncation_side", "right")
     tokenizer.truncation_side = "left"
     try:
+        # Pad to the longest sequence in the batch (not to max_length) to avoid
+        # wasting compute on padding tokens when sequences are short.
+        # max_length is still used for truncation of overlong sequences.
         processor_kwargs = {
             "tokenize": True,
-            "padding": "max_length" if max_length is not None else True,
+            "padding": True,
             "truncation": True,
             "return_tensors": "pt",
             "return_dict": True,
