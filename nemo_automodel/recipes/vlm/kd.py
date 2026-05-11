@@ -224,11 +224,12 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             else nullcontext()
         )
         with sync_ctx, train_ctx():
-            # Teacher forward (no grad).
+            # Teacher forward (no grad) — free intermediates immediately.
             with torch.no_grad():
                 teacher_batch = filter_forward_kwargs(self.teacher_model, batch)
                 teacher_out = self.teacher_model(**teacher_batch)
-                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach().clone()
+                teacher_logits = getattr(teacher_out, "logits", teacher_out).detach()
+                del teacher_out, teacher_batch
 
             # Student forward.
             student_batch = filter_forward_kwargs(model, batch)
@@ -237,8 +238,13 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 student_out = model(logits_to_keep=1, **student_batch)
             else:
                 student_out = model(**student_batch)
+            del student_batch
 
             student_logits = getattr(student_out, "logits", student_out)
+            hidden_states = (
+                student_out.hidden_states[-1] if getattr(student_out, "hidden_states", None) is not None else None
+            )
+            del student_out
 
             # CE loss (skip when kd_ratio >= 1.0).
             if self.kd_ratio >= 1.0:
@@ -249,11 +255,10 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     logits=student_logits,
                     labels=labels,
                     model=model,
-                    hidden_states=student_out.hidden_states[-1]
-                    if getattr(student_out, "hidden_states", None) is not None
-                    else None,
+                    hidden_states=hidden_states,
                     num_label_tokens=num_label_tokens,
                 )
+            del hidden_states
 
             kd_loss = self.kd_loss_fn(
                 student_logits,
@@ -261,6 +266,8 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                 labels,
                 num_batch_labels=num_label_tokens,
             )
+            del teacher_logits
+
             local_loss = (1.0 - self.kd_ratio) * ce_loss + self.kd_ratio * kd_loss
             loss_buffer.append(local_loss.detach().clone())
             self._ce_loss_buffer.append(ce_loss.detach().clone())
