@@ -34,7 +34,7 @@ so it can be launched exactly the same way as other recipes:
 
     python -m torch.distributed.run --nproc-per-node=8 \\
         nemo_automodel/recipes/vlm/kd.py \\
-        -c examples/vlm_kd/qwen2_5/qwen2_5_vl_3b_kd.yaml
+        -c examples/vlm_kd/qwen3_5/qwen3_5_vl_4b_kd.yaml
 """
 
 from __future__ import annotations
@@ -495,8 +495,8 @@ def main(config_path=None):
             pathlib.Path(__file__).parent.resolve().parent.parent
             / "examples"
             / "vlm_kd"
-            / "qwen2_5"
-            / "qwen2_5_vl_3b_kd.yaml"
+            / "qwen3_5"
+            / "qwen3_5_vl_4b_kd.yaml"
         )
     cfg = parse_args_and_load_config(config_path)
     trainer = KnowledgeDistillationRecipeForVLM(cfg)
