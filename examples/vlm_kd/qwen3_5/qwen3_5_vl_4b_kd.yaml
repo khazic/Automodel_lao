@@ -68,6 +68,9 @@ distributed:
   ep_size: 1
   sequence_parallel: false
 
+clip_grad_norm:
+  max_norm: 5.0
+
 loss_fn:
   _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
 
@@ -81,7 +84,7 @@ kd_loss_fn:
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 2e-5
+  lr: 5e-5
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
