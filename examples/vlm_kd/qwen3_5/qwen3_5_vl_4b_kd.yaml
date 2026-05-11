@@ -109,8 +109,8 @@ validation_dataloader:
   collate_fn:
     _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
 
-# Student: freeze vision+audio towers, train language model
+# Student: freeze vision+audio towers, train language model only
 freeze_config:
-  freeze_vision_tower: false
+  freeze_vision_tower: true
   freeze_audio_tower: true
   freeze_language_model: false
