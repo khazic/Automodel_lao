@@ -89,7 +89,7 @@ optimizer:
 # MedPix-VQA dataset (medical images + VQA)
 dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
+  path_or_dataset: /llm-align/liuchonghan/datasets/medpix_vqa
   split: train
 
 dataloader:
@@ -100,7 +100,7 @@ dataloader:
 
 validation_dataset:
   _target_: nemo_automodel.components.datasets.vlm.datasets.make_medpix_dataset
-  path_or_dataset: mmoukouba/MedPix-VQA
+  path_or_dataset: /llm-align/liuchonghan/datasets/medpix_vqa
   split: validation
 
 validation_dataloader:
