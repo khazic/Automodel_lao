@@ -366,9 +366,9 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
             for mp in self.model_parts:
                 mp.eval()
 
-            total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            total_ce_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
-            total_kd_loss = torch.tensor(0.0, dtype=torch.float32, device=self.dist_env.device)
+            total_loss = 0.0
+            total_ce_loss = 0.0
+            total_kd_loss = 0.0
             total_num_label_tokens = 0
             loss_buffer: list[torch.Tensor] = []
 
@@ -382,27 +382,37 @@ class KnowledgeDistillationRecipeForVLM(FinetuneRecipeForVLM):
                     num_batches=1,
                     is_train=False,
                 )
+                # _forward_backward_step produces per-token-averaged losses.
+                # Multiply back by num_label_tokens to get the sum for weighted averaging.
+                total_loss += loss_buffer[-1].item() * num_label_tokens
+                total_ce_loss += self._ce_loss_buffer[-1].item() * num_label_tokens
+                total_kd_loss += self._kd_loss_buffer[-1].item() * num_label_tokens
                 total_num_label_tokens += num_label_tokens
 
-            total_loss = torch.sum(torch.stack(loss_buffer)) if loss_buffer else total_loss
-            total_ce_loss = torch.stack(self._ce_loss_buffer).sum() if self._ce_loss_buffer else total_ce_loss
-            total_kd_loss = torch.stack(self._kd_loss_buffer).sum() if self._kd_loss_buffer else total_kd_loss
             self._ce_loss_buffer.clear()
             self._kd_loss_buffer.clear()
 
-        total_loss = self._dp_allreduce(total_loss, include_cp=True).item()
-        total_ce_loss = self._dp_allreduce(total_ce_loss, include_cp=True).item()
-        total_kd_loss = self._dp_allreduce(total_kd_loss, include_cp=True).item()
+        total_loss = self._dp_allreduce(
+            torch.tensor(total_loss, dtype=torch.float32, device=self.dist_env.device), include_cp=True
+        ).item()
+        total_ce_loss = self._dp_allreduce(
+            torch.tensor(total_ce_loss, dtype=torch.float32, device=self.dist_env.device), include_cp=True
+        ).item()
+        total_kd_loss = self._dp_allreduce(
+            torch.tensor(total_kd_loss, dtype=torch.float32, device=self.dist_env.device), include_cp=True
+        ).item()
         total_num_label_tokens = self._dp_allreduce(torch.tensor(total_num_label_tokens, dtype=torch.long)).item()
 
         val_loss = total_loss / max(total_num_label_tokens, 1e-8)
+        val_ce_loss = total_ce_loss / max(total_num_label_tokens, 1e-8)
+        val_kd_loss = total_kd_loss / max(total_num_label_tokens, 1e-8)
         return MetricsSample(
             step=self.step_scheduler.step,
             epoch=self.step_scheduler.epoch,
             metrics={
                 "val_loss": val_loss,
-                "ce_loss": total_ce_loss,
-                "kd_loss": total_kd_loss,
+                "ce_loss": val_ce_loss,
+                "kd_loss": val_kd_loss,
                 "lr": self.optimizer[0].param_groups[0]["lr"],
                 "num_label_tokens": total_num_label_tokens,
                 "mem": torch.cuda.max_memory_allocated() / 1024**3,
