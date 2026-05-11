@@ -26,7 +26,7 @@ step_scheduler:
   ckpt_every_steps: 200
   val_every_steps: 50
   num_epochs: 2
-  max_steps: 100
+  max_steps: 300
 
 dist_env:
   backend: nccl
@@ -76,13 +76,13 @@ kd_ratio: 0.5
 kd_loss_fn:
   _target_: nemo_automodel.components.loss.kd_loss.KDLoss
   ignore_index: -100
-  temperature: 2.0
+  temperature: 1.0
   fp32_upcast: true
 
 optimizer:
   _target_: torch.optim.AdamW
-  lr: 1e-5
-  weight_decay: 0.1
+  lr: 2e-5
+  weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1e-8
 
