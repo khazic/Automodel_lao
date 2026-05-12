@@ -63,6 +63,8 @@ from nemo_automodel.components.loggers.metric_logger import MetricsSample, build
 from nemo_automodel.components.loggers.wandb_utils import suppress_wandb_log_messages
 from nemo_automodel.components.loss.linear_ce import FusedLinearCrossEntropy
 from nemo_automodel.components.loss.masked_ce import MaskedCrossEntropy
+from nemo_automodel.components.loss.mtp import MultiTokenPredictionCrossEntropy
+from nemo_automodel.components.models.qwen3_5.mtp import compute_qwen3_5_mtp_logits, extract_mtp_logits
 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.quantization.fp8 import build_fp8_config
@@ -705,6 +707,14 @@ def calculate_loss(loss_fn, **kwargs) -> torch.Tensor:
                 "lm_weight": lm_head,
             }
         )
+    elif isinstance(loss_fn, MultiTokenPredictionCrossEntropy):
+        loss_fn_kwargs.update(
+            {
+                "logits": kwargs.pop("logits"),
+                "labels": kwargs.pop("labels"),
+                "mtp_logits": kwargs.pop("mtp_logits"),
+            }
+        )
     else:
         loss_fn_kwargs.update(
             {
@@ -1006,6 +1016,8 @@ class FinetuneRecipeForVLM(BaseRecipe):
         labels = batch.pop("labels")
 
         if self.pp_enabled:
+            if isinstance(self.loss_fn, MultiTokenPredictionCrossEntropy):
+                raise NotImplementedError("MTP training is not supported with VLM pipeline parallelism yet.")
             if not is_train:
                 logging.info("Skipping forward pass for validation because pipeline parallelism is enabled")
                 return
@@ -1118,6 +1130,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
             )
             with sync_ctx, train_ctx():
                 batch = filter_forward_kwargs(model, batch)
+                mtp_logits = None
                 if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                     # use num_logits_to_keep to avoid full logits matrix in memory
                     out = model(logits_to_keep=1, **batch)
@@ -1126,6 +1139,22 @@ class FinetuneRecipeForVLM(BaseRecipe):
                             "FusedLinearCrossEntropy requires the model to output hidden states. "
                             "Set `model.text_config.output_hidden_states=True` in the config."
                         )
+                elif isinstance(self.loss_fn, MultiTokenPredictionCrossEntropy):
+                    input_ids = batch.get("input_ids")
+                    attention_mask = batch.get("attention_mask")
+                    position_ids = batch.get("position_ids")
+                    out = model(output_hidden_states=True, **batch)
+                    mtp_logits = extract_mtp_logits(out)
+                    if mtp_logits is None:
+                        mtp_logits = compute_qwen3_5_mtp_logits(
+                            model,
+                            input_ids=input_ids,
+                            hidden_states=out.hidden_states[-1]
+                            if getattr(out, "hidden_states", None) is not None
+                            else None,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                        )
                 else:
                     out = model(**batch)
 
@@ -1133,6 +1162,7 @@ class FinetuneRecipeForVLM(BaseRecipe):
                     self.loss_fn,
                     logits=getattr(out, "logits", out),
                     labels=labels,
+                    mtp_logits=mtp_logits,
                     model=model,
                     hidden_states=out.hidden_states[-1] if getattr(out, "hidden_states", None) is not None else None,
                     num_label_tokens=num_label_tokens,
@@ -1322,14 +1352,32 @@ class FinetuneRecipeForVLM(BaseRecipe):
                 labels = batch.pop("labels")
                 with train_ctx():
                     batch = filter_forward_kwargs(self.model_parts[0], batch)
+                    mtp_logits = None
                     if isinstance(self.loss_fn, FusedLinearCrossEntropy):
                         out = self.model_parts[0](logits_to_keep=1, **batch)
+                    elif isinstance(self.loss_fn, MultiTokenPredictionCrossEntropy):
+                        input_ids = batch.get("input_ids")
+                        attention_mask = batch.get("attention_mask")
+                        position_ids = batch.get("position_ids")
+                        out = self.model_parts[0](output_hidden_states=True, **batch)
+                        mtp_logits = extract_mtp_logits(out)
+                        if mtp_logits is None:
+                            mtp_logits = compute_qwen3_5_mtp_logits(
+                                self.model_parts[0],
+                                input_ids=input_ids,
+                                hidden_states=out.hidden_states[-1]
+                                if getattr(out, "hidden_states", None) is not None
+                                else None,
+                                attention_mask=attention_mask,
+                                position_ids=position_ids,
+                            )
                     else:
                         out = self.model_parts[0](**batch)
                     local_loss = calculate_loss(
                         self.loss_fn,
                         logits=getattr(out, "logits", out),
                         labels=labels,
+                        mtp_logits=mtp_logits,
                         model=self.model_parts[0],
                         hidden_states=out.hidden_states[-1]
                         if getattr(out, "hidden_states", None) is not None
