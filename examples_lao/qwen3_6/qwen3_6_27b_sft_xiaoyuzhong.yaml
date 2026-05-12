@@ -1,0 +1,118 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Qwen3.6-27B full-parameter SFT on xiaoyuzhong text-only parquet messages.
+#
+# Launch:
+#   bash examples_lao/qwen3_6/run_qwen3_6_27b_sft_k8s.sh
+
+recipe: FinetuneRecipeForVLM
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 2000
+  val_every_steps: null
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 360
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /llm-align/open_models/Qwen3_6-27b
+  attn_implementation: sdpa
+  torch_dtype: bfloat16
+
+processor:
+  _target_: transformers.AutoProcessor.from_pretrained
+  pretrained_model_name_or_path: /llm-align/open_models/Qwen3_6-27b
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /llm-align/liuchonghan/ckpt_automodel/qwen3_6_27b_sft_xiaoyuzhong/
+  model_save_format: safetensors
+  save_consolidated: true
+
+distributed:
+  _target_: nemo_automodel.components.distributed.fsdp2.FSDP2Manager
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  dp_replicate_size: 1
+  ep_size: 1
+  sequence_parallel: false
+  activation_checkpointing: true
+
+  pipeline:
+    pp_schedule: interleaved1f1b
+    pp_microbatch_size: 1
+    layers_per_stage: 2
+    scale_grads_in_schedule: false
+    round_virtual_stages_to_pp_multiple: up
+    dtype: bf16
+
+freeze_config:
+  freeze_vision_tower: true
+  freeze_audio_tower: true
+  freeze_language_model: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/qwen3_6/parquet_messages_dataset.py:make_parquet_messages_dataset
+  path_or_dataset:
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/Gemini3_translate_110w_1096687.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-001-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-002-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-003-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-004-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-005-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-006-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-007-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-008-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-009-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-010-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/part-011-of-011.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/trans_multi2multi_110w_gemini25_claude_only_messages.parquet
+    - /llm-align/liuchonghan/ins_dataset/ins_dataset/xiaoyuzhong/zangyu_165039.parquet
+  split: train
+  shuffle_seed: 42
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  num_workers: 0
+  pin_memory: true
+  collate_fn:
+    _target_: /llm-align/liuchonghan/Automodel_lao/examples_lao/qwen3_6/parquet_messages_dataset.py:qwen3_6_prefix_truncating_collate_fn
+    max_length: 4096
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.1
+
+# wandb:
+#   project: <your-project>
+#   entity: <your-entity>
+#   name: qwen3-6-27b-sft-xiaoyuzhong
