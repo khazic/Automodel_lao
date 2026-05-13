@@ -80,10 +80,11 @@ class TrainEagle3Recipe(BaseRecipe):
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
         )
+        self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         self.target_model = NeMoAutoModelForCausalLM.from_pretrained(
             target_path,
             trust_remote_code=recipe_cfg.get("trust_remote_code", False),
-            torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
+            torch_dtype=self.compute_dtype,
             force_hf=True,
         ).to(self.device)
         self.target_wrapper = HFEagle3TargetModel(
@@ -133,7 +134,14 @@ class TrainEagle3Recipe(BaseRecipe):
         draft_config["draft_vocab_size"] = int(selected_token_ids.numel())
         draft_config["target_hidden_size"] = target_config.hidden_size
         draft_config["architectures"] = ["LlamaEagle3DraftModel"]
-        self.draft_model = LlamaEagle3DraftModel(LlamaConfig.from_dict(draft_config)).to(self.device)
+        # Cast to the target's compute dtype so every linear / embedding / norm
+        # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
+        # in from the target. Without this, ``initialize_rms_norm_module`` defaults
+        # to bf16 while ``nn.Linear`` defaults to fp32, and ``hidden_proj`` errors
+        # with ``expected mat1 and mat2 to have the same dtype``.
+        self.draft_model = LlamaEagle3DraftModel(LlamaConfig.from_dict(draft_config)).to(
+            device=self.device, dtype=self.compute_dtype
+        )
         self.draft_model.copy_embeddings_from_target(self.target_wrapper.get_input_embeddings())
         if recipe_cfg.get("freeze_embeddings", True):
             self.draft_model.freeze_embeddings()
