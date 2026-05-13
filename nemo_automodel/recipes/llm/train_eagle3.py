@@ -235,6 +235,19 @@ class TrainEagle3Recipe(BaseRecipe):
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
         self.trainer_module.train()
+        try:
+            batches_per_epoch = len(self.train_dataloader)
+        except TypeError:
+            batches_per_epoch = None
+        if self.dist_env.is_main:
+            logger.info(
+                "Training start: num_epochs=%s batches_per_epoch=%s grad_accum=%s log_every=%s",
+                self.num_epochs,
+                batches_per_epoch,
+                self.grad_accumulation_steps,
+                self.log_every_steps,
+            )
+
         for epoch in range(self.num_epochs):
             if hasattr(self.train_dataloader.sampler, "set_epoch"):
                 self.train_dataloader.sampler.set_epoch(epoch)
@@ -286,6 +299,14 @@ class TrainEagle3Recipe(BaseRecipe):
                         running_acc.zero_()
                         running_steps = 0
 
+            if self.dist_env.is_main:
+                logger.info(
+                    "Epoch %s done: total_batches_seen=%s global_step=%s",
+                    epoch,
+                    batch_idx + 1,
+                    self.runtime.global_step,
+                )
+
             eval_metrics = self._run_eval()
             if eval_metrics is not None and self.dist_env.is_main:
                 logger.info(
@@ -294,7 +315,13 @@ class TrainEagle3Recipe(BaseRecipe):
                     eval_metrics[0].item(),
                     eval_metrics[1].item(),
                 )
-            self._save_checkpoint(f"epoch_{epoch:02d}_step_{self.runtime.global_step:06d}")
+            ckpt_name = f"epoch_{epoch:02d}_step_{self.runtime.global_step:06d}"
+            self._save_checkpoint(ckpt_name)
+            if self.dist_env.is_main:
+                logger.info("Saved checkpoint: %s", self.output_dir / ckpt_name)
+
+        if self.dist_env.is_main:
+            logger.info("Training complete: global_step=%s", self.runtime.global_step)
 
 
 def main(config_path=None):
