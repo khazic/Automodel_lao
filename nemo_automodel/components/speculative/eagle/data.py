@@ -105,7 +105,15 @@ def build_eagle3_token_mapping(
         counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
 
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        # NCCL collectives require CUDA tensors; move counts onto the current
+        # device for the reduction and bring it back to CPU for the Python-side
+        # selection logic below.
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            counts_for_reduce = counts.to(torch.device("cuda", torch.cuda.current_device()))
+            dist.all_reduce(counts_for_reduce, op=dist.ReduceOp.SUM)
+            counts = counts_for_reduce.cpu()
+        else:
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
 
     selected: list[int] = []
     seen: set[int] = set()
