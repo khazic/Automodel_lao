@@ -95,6 +95,7 @@ class Eagle3TrainerModule(nn.Module):
         cur_attention_mask = attention_mask
         cur_loss_mask = loss_mask
         cur_position_mask = position_mask
+        cur_target_probs = target_probs
         cur_hidden_states = hidden_states
 
         for step_idx in range(self.ttt_steps):
@@ -104,16 +105,15 @@ class Eagle3TrainerModule(nn.Module):
                 attention_mask=cur_attention_mask,
             )
             logits = self.draft_model.compute_logits(cur_hidden_states)
-            step_target_probs = target_probs[:, step_idx : step_idx + logits.shape[1], :]
             step_loss = masked_soft_cross_entropy(
                 logits=logits,
-                target_probs=step_target_probs,
+                target_probs=cur_target_probs,
                 position_mask=cur_position_mask,
             )
             running_loss = running_loss + step_loss
 
             valid_mask = cur_position_mask.squeeze(-1).bool()
-            correct = (logits.argmax(dim=-1) == step_target_probs.argmax(dim=-1)) & valid_mask
+            correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
             running_correct = running_correct + correct.sum()
             running_valid = running_valid + valid_mask.sum()
 
@@ -122,6 +122,7 @@ class Eagle3TrainerModule(nn.Module):
                 cur_attention_mask = _shift_left_with_zero(cur_attention_mask)
                 cur_loss_mask = _shift_left_with_zero(cur_loss_mask)
                 cur_position_mask = _shift_left_with_zero(cur_position_mask)
+                cur_target_probs = _shift_left_with_zero(cur_target_probs)
 
         avg_loss = running_loss / float(self.ttt_steps)
         accuracy = running_correct / running_valid.clamp_min(1.0)

@@ -16,10 +16,10 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -79,6 +79,10 @@ def build_eagle3_token_mapping(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build draft-vocab mapping tensors from supervised token frequency.
 
+    Counts are accumulated as a dense ``[target_vocab_size]`` tensor and
+    ``all_reduce`` summed across ranks when ``torch.distributed`` is
+    initialized, so every rank ends up with the same draft vocabulary.
+
     Returns:
         Tuple ``(selected_token_ids, selected_token_mask)`` where:
         - ``selected_token_ids`` has shape ``[draft_vocab_size]``
@@ -89,12 +93,19 @@ def build_eagle3_token_mapping(
         selected_token_mask = torch.ones(target_vocab_size, dtype=torch.bool)
         return selected_token_ids, selected_token_mask
 
-    counter: Counter[int] = Counter()
+    counts = torch.zeros(target_vocab_size, dtype=torch.long)
     for batch in dataloader:
         input_ids = batch["input_ids"]
         loss_mask = batch["loss_mask"].bool()
-        supervised_ids = input_ids[loss_mask]
-        counter.update(supervised_ids.tolist())
+        supervised_ids = input_ids[loss_mask].to(torch.long).flatten()
+        if supervised_ids.numel() == 0:
+            continue
+        in_range = (supervised_ids >= 0) & (supervised_ids < target_vocab_size)
+        supervised_ids = supervised_ids[in_range]
+        counts.scatter_add_(0, supervised_ids, torch.ones_like(supervised_ids))
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
 
     selected: list[int] = []
     seen: set[int] = set()
@@ -104,13 +115,14 @@ def build_eagle3_token_mapping(
         selected.append(int(token_id))
         seen.add(int(token_id))
 
-    for token_id, _count in counter.most_common():
-        if token_id in seen or token_id < 0 or token_id >= target_vocab_size:
+    sorted_token_ids = torch.argsort(counts, descending=True, stable=True).tolist()
+    for token_id in sorted_token_ids:
+        if len(selected) >= draft_vocab_size:
+            break
+        if token_id in seen or counts[token_id].item() == 0:
             continue
         selected.append(token_id)
         seen.add(token_id)
-        if len(selected) >= draft_vocab_size:
-            break
 
     for token_id in range(target_vocab_size):
         if len(selected) >= draft_vocab_size:

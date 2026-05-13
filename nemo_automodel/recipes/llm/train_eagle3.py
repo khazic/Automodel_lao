@@ -63,7 +63,7 @@ class TrainEagle3Recipe(BaseRecipe):
         )
         setup_logging()
 
-        recipe_cfg = self.cfg.recipe
+        recipe_cfg = self.cfg.recipe_args
         self.device = self.dist_env.device or torch.device("cpu")
 
         target_path = recipe_cfg.target_model_name_or_path
