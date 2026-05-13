@@ -1,0 +1,51 @@
+recipe: TrainEagle3Recipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 60
+
+recipe_args:
+  # Update these three paths to match your environment.
+  target_model_name_or_path: /llm-align/liuchonghan/dir
+  train_data_path: /llm-align/liuchonghan/ins_dataset/ins_dataset/tulu3_34999.parquet
+  val_data_path: null
+
+  train_split: null
+  val_split: null
+
+  output_dir: ./outputs/eagle3_llama_tulu3_full
+
+  # Llama-3.1 was trained at 8K context. EAGLE-3 supervision is short-range
+  # by construction (we only predict the next 1..ttt_steps tokens), so 2048
+  # is a sensible production length that fits comfortably on A100/H100.
+  seq_length: 2048
+
+  # 8 GPUs * micro_batch=1 * grad_accum=4 -> effective batch 32.
+  micro_batch_size: 1
+  grad_accumulation_steps: 4
+  num_workers: 4
+
+  num_epochs: 3
+
+  # Test-time-training unroll length. 4 matches the SpecForge reference.
+  ttt_steps: 4
+
+  # Llama-3 vocab is 128k. EAGLE-3 papers use 32k draft vocab to cut
+  # lm_head FLOPs while keeping accuracy.
+  draft_vocab_size: 32000
+
+  # Initialize the draft input embeddings from the target and keep them
+  # frozen, so the draft only learns the projection + decoder + lm_head.
+  freeze_embeddings: true
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 20
+  max_grad_norm: 1.0
+
+optimizer:
+  # Small draft model trained from scratch -> larger LR than typical
+  # finetuning. 5e-4 with bf16 params + AdamW fp32 state is stable.
+  lr: 5.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
