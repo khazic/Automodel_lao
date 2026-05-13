@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import pathlib
 from types import SimpleNamespace
 
@@ -163,9 +164,10 @@ class TrainEagle3Recipe(BaseRecipe):
         self.trainer_module = trainer_module
 
         opt_cfg = self.cfg.optimizer
+        self.peak_lr = float(opt_cfg.lr)
         self.optimizer = torch.optim.AdamW(
-            self.trainer_module.parameters(),
-            lr=opt_cfg.lr,
+            [p for p in self.trainer_module.parameters() if p.requires_grad],
+            lr=self.peak_lr,
             betas=tuple(opt_cfg.get("betas", (0.9, 0.95))),
             weight_decay=opt_cfg.get("weight_decay", 0.0),
         )
@@ -175,6 +177,35 @@ class TrainEagle3Recipe(BaseRecipe):
         self.log_every_steps = recipe_cfg.get("log_every_steps", 10)
         self.output_dir = pathlib.Path(recipe_cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Warmup + cosine LR schedule. EAGLE-3 from-scratch training with a
+        # flat LR diverges after the first epoch (loss climbs back up); a
+        # cosine schedule keeps the optimizer step size small enough once
+        # AdamW's second-moment estimates have settled.
+        try:
+            num_batches_per_epoch = len(self.train_dataloader)
+        except TypeError:
+            num_batches_per_epoch = 0
+        total_optim_steps = max(
+            1,
+            (self.num_epochs * num_batches_per_epoch) // self.grad_accumulation_steps,
+        )
+        warmup_ratio = float(opt_cfg.get("warmup_ratio", 0.05))
+        min_lr_ratio = float(opt_cfg.get("min_lr_ratio", 0.1))
+        warmup_steps = max(1, int(warmup_ratio * total_optim_steps))
+
+        def _lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            progress = (step - warmup_steps) / max(1, total_optim_steps - warmup_steps)
+            progress = min(max(progress, 0.0), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, _lr_lambda)
+        self.total_optim_steps = total_optim_steps
+        self.warmup_steps = warmup_steps
+        self.min_lr_ratio = min_lr_ratio
 
         self.runtime = SimpleNamespace(global_step=0)
 
@@ -241,11 +272,16 @@ class TrainEagle3Recipe(BaseRecipe):
             batches_per_epoch = None
         if self.dist_env.is_main:
             logger.info(
-                "Training start: num_epochs=%s batches_per_epoch=%s grad_accum=%s log_every=%s",
+                "Training start: num_epochs=%s batches_per_epoch=%s grad_accum=%s log_every=%s "
+                "total_optim_steps=%s warmup_steps=%s peak_lr=%.3e min_lr_ratio=%s",
                 self.num_epochs,
                 batches_per_epoch,
                 self.grad_accumulation_steps,
                 self.log_every_steps,
+                self.total_optim_steps,
+                self.warmup_steps,
+                self.peak_lr,
+                self.min_lr_ratio,
             )
 
         for epoch in range(self.num_epochs):
@@ -281,19 +317,22 @@ class TrainEagle3Recipe(BaseRecipe):
                 if (batch_idx + 1) % self.grad_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(self.trainer_module.parameters(), self.max_grad_norm)
                     self.optimizer.step()
+                    self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.runtime.global_step += 1
 
                     if self.runtime.global_step % self.log_every_steps == 0:
                         mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
                         mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                        current_lr = self.lr_scheduler.get_last_lr()[0]
                         if self.dist_env.is_main:
                             logger.info(
-                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f",
+                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e",
                                 epoch,
                                 self.runtime.global_step,
                                 mean_loss.item(),
                                 mean_acc.item(),
+                                current_lr,
                             )
                         running_loss.zero_()
                         running_acc.zero_()

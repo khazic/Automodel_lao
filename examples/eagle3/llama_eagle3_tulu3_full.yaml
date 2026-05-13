@@ -44,8 +44,13 @@ recipe_args:
   max_grad_norm: 1.0
 
 optimizer:
-  # Small draft model trained from scratch -> larger LR than typical
-  # finetuning. 5e-4 with bf16 params + AdamW fp32 state is stable.
-  lr: 5.0e-4
+  # Peak LR after warmup. Constant 5e-4 diverges after ~1 epoch
+  # (loss bottoms ~2.76 then climbs to ~3.5); 2e-4 + cosine decay is
+  # stable across all 3 epochs.
+  lr: 2.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.0
+  # LR schedule: linear warmup over the first ``warmup_ratio`` fraction
+  # of total optimizer steps, then cosine decay to ``min_lr_ratio * lr``.
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
