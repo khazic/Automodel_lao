@@ -14,7 +14,11 @@ recipe_args:
   train_data_path: /llm-align/liuchonghan/datasets/frankleeeee/PerfectBlend-Regenerated-Llama-3.1-8B-Instruct/messages
   val_data_path: null
 
-  train_split: null
+  # Full PerfectBlend is 1.42M rows -> ~14h/epoch on 8 GPUs and roughly
+  # 3x what an EAGLE-3 draft needs to converge. Slice down to 200k
+  # samples for a ~2h/epoch run; remove this line (or set to null) to
+  # train on the full corpus.
+  train_split: "train[:200000]"
   val_split: null
 
   output_dir: ./outputs/eagle3_llama_perfectblend
@@ -26,10 +30,9 @@ recipe_args:
   grad_accumulation_steps: 4
   num_workers: 4
 
-  # PerfectBlend has ~1.42M rows -> ~44k optim steps per epoch on 8 GPUs.
-  # One epoch is already more total training than 3 epochs on tulu3 (35k
-  # samples, ~3.3k optim steps total), so default to a single pass and
-  # let the schedule decay across it.
+  # 200k samples * 1 epoch / 8 ranks / grad_accum=4 ≈ 6.25k optim steps.
+  # If you switch to the full 1.42M, this still works -- it just runs
+  # ~7x longer per epoch.
   num_epochs: 1
 
   ttt_steps: 4
@@ -38,14 +41,14 @@ recipe_args:
 
   trust_remote_code: false
   shuffle_seed: 42
-  log_every_steps: 50
+  log_every_steps: 20
   max_grad_norm: 1.0
 
 optimizer:
   lr: 2.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.0
-  # Total optim steps is ~44k, so a 2% warmup ≈ 880 steps -- plenty for
-  # AdamW second moments to settle without burning epoch start.
-  warmup_ratio: 0.02
+  # 5% of ~6.25k optim steps ≈ 310 warmup steps -- enough for AdamW
+  # second moments to settle.
+  warmup_ratio: 0.05
   min_lr_ratio: 0.1
