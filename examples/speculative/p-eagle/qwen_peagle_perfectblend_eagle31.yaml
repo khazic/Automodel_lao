@@ -1,0 +1,67 @@
+recipe: TrainEagle3Recipe
+
+# P-EAGLE + EAGLE-3.1 stabilization (STRONG baseline).
+#
+# Identical to ``qwen_peagle_perfectblend.yaml`` (Qwen3-8B target, PerfectBlend
+# data, num_depths=8, num_draft_layers=4) but with the EAGLE-3.1 drafter
+# stabilization toggles ENABLED:
+#
+#   fc_norm:     per-aux-chunk RMSNorm before ``fc`` (stabilizes the per-aux
+#                hidden-state scale; also applied to the P-EAGLE ``mask_hidden``
+#                placeholder since it shares the ``project_hidden_states`` path).
+#   norm_output: route the post-``norm`` hidden state to ``compute_logits``
+#                (and the next-depth input), avoiding double normalization.
+#
+# Both flags were added by https://github.com/NVIDIA-NeMo/Automodel/pull/2322 to
+# combat the speculation-depth "attention drift" failure mode. This config is the
+# fair EAGLE-3.1 control for the target-KV-reuse experiment: any acceptance gain
+# from KV reuse must be measured ON TOP of this stabilization, not against the
+# raw P-EAGLE baseline alone.
+#
+# See ``qwen_peagle_perfectblend.yaml`` for the dataset-prep one-liner and the
+# vLLM-runtime / SGLang caveats (unchanged here).
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-8B
+
+  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen-messages
+  val_data_path: null
+
+  train_split: "train[:70000]"
+  val_split: null
+
+  output_dir: ./outputs/peagle_qwen3_8b_perfectblend_eagle31
+  seq_length: 4096
+  micro_batch_size: 1
+  grad_accumulation_steps: 1
+  num_workers: 8
+  num_epochs: 5
+  draft_vocab_size: 32000
+  selected_token_ids_path: ./outputs/peagle_qwen3_8b_perfectblend_eagle31/draft_token_map_32000.pt
+  freeze_embeddings: false
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 50
+  max_grad_norm: 1.0
+
+  # P-EAGLE knobs (identical to the base recipe).
+  parallel_drafting: true
+  num_depths: 8
+  num_draft_layers: 4
+  down_sample_ratio: 0.8
+  down_sample_ratio_min: 0.2
+  mask_token_id: 151669
+
+  # EAGLE-3.1 stabilization (the only delta vs the base recipe).
+  fc_norm: true
+  norm_output: true
+
+optimizer:
+  lr: 6e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0
+  warmup_ratio: 0.015
