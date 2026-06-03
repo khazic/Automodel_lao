@@ -51,6 +51,8 @@ class Eagle3StepMetrics:
     loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    depth_correct_tokens: torch.Tensor | None = None
+    depth_valid_tokens: torch.Tensor | None = None
 
 
 class Eagle3TrainerModule(nn.Module):
@@ -115,6 +117,8 @@ class Eagle3TrainerModule(nn.Module):
         running_loss = hidden_states.new_zeros(())
         running_correct = hidden_states.new_zeros(())
         running_valid = hidden_states.new_zeros(())
+        depth_correct = hidden_states.new_zeros((self.ttt_steps,))
+        depth_valid = hidden_states.new_zeros((self.ttt_steps,))
 
         cur_input_ids = input_ids
         cur_position_mask = position_mask
@@ -153,8 +157,12 @@ class Eagle3TrainerModule(nn.Module):
 
             valid_mask = cur_position_mask.squeeze(-1).bool()
             correct = (logits.argmax(dim=-1) == cur_target_probs.argmax(dim=-1)) & valid_mask
-            running_correct = running_correct + correct.sum()
-            running_valid = running_valid + valid_mask.sum()
+            step_correct = correct.sum()
+            step_valid = valid_mask.sum()
+            running_correct = running_correct + step_correct
+            running_valid = running_valid + step_valid
+            depth_correct[step_idx] = step_correct
+            depth_valid[step_idx] = step_valid
 
             if step_idx + 1 < self.ttt_steps:
                 cur_input_ids = _shift_left_with_zero(cur_input_ids)
@@ -163,7 +171,13 @@ class Eagle3TrainerModule(nn.Module):
 
         avg_loss = running_loss / weight_sum
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss, accuracy=accuracy, valid_tokens=running_valid)
+        return Eagle3StepMetrics(
+            loss=avg_loss,
+            accuracy=accuracy,
+            valid_tokens=running_valid,
+            depth_correct_tokens=depth_correct,
+            depth_valid_tokens=depth_valid,
+        )
 
 
 def _kl_div_loss(logits: torch.Tensor, target_logits: torch.Tensor) -> torch.Tensor:
@@ -266,6 +280,8 @@ class PEagleTrainerModule(nn.Module):
         loss_den = mask_hidden_proj.new_zeros(())
         running_correct = mask_hidden_proj.new_zeros(())
         running_valid = mask_hidden_proj.new_zeros(())
+        depth_correct = mask_hidden_proj.new_zeros((self.num_depths,))
+        depth_valid = mask_hidden_proj.new_zeros((self.num_depths,))
 
         for b in range(batch_size):
             row_loss_mask = loss_mask[b : b + 1].long()  # [1, seq_len]
@@ -326,11 +342,33 @@ class PEagleTrainerModule(nn.Module):
             loss_den = loss_den + mask_f.sum()
 
             correct = (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & sampled_loss_mask
-            running_correct = running_correct + correct.sum()
-            running_valid = running_valid + sampled_loss_mask.sum()
+            row_correct = correct.to(depth_correct.dtype)
+            row_valid = sampled_loss_mask.to(depth_valid.dtype)
+            running_correct = running_correct + row_correct.sum()
+            running_valid = running_valid + row_valid.sum()
+            depth_correct = (
+                depth_correct
+                + torch.bincount(
+                    depth,
+                    weights=row_correct,
+                    minlength=self.num_depths,
+                )[: self.num_depths]
+            )
+            depth_valid = (
+                depth_valid
+                + torch.bincount(
+                    depth,
+                    weights=row_valid,
+                    minlength=self.num_depths,
+                )[: self.num_depths]
+            )
 
         avg_loss = loss_num / loss_den.clamp_min(1e-5)
         accuracy = running_correct / running_valid.clamp_min(1.0)
         return Eagle3StepMetrics(
-            loss=avg_loss.to(mask_hidden_proj.dtype), accuracy=accuracy, valid_tokens=running_valid
+            loss=avg_loss.to(mask_hidden_proj.dtype),
+            accuracy=accuracy,
+            valid_tokens=running_valid,
+            depth_correct_tokens=depth_correct,
+            depth_valid_tokens=depth_valid,
         )

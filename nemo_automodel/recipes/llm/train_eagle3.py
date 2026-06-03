@@ -57,6 +57,7 @@ from nemo_automodel.recipes.base_recipe import (
     _is_checkpoint_model_config_compatible,
     _resolve_restore_from_to_ckpt_dir,
 )
+from nemo_automodel.shared.import_utils import safe_import
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,48 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         value = value / dist.get_world_size()
     return value
+
+
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    value = value.clone()
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return value
+
+
+def _reduce_depth_accuracy(
+    depth_correct: torch.Tensor | None,
+    depth_valid: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if depth_correct is None or depth_valid is None:
+        return None, None
+    reduced_correct = _all_reduce_sum(depth_correct.float())
+    reduced_valid = _all_reduce_sum(depth_valid.float())
+    return reduced_correct / reduced_valid.clamp_min(1.0), reduced_valid
+
+
+def _depth_accuracy_log(
+    prefix: str,
+    depth_accuracy: torch.Tensor | None,
+    depth_valid: torch.Tensor | None,
+) -> dict[str, float]:
+    if depth_accuracy is None or depth_valid is None:
+        return {}
+    log_data = {}
+    for depth_idx, (accuracy, valid) in enumerate(zip(depth_accuracy, depth_valid)):
+        if valid.item() > 0:
+            log_data[f"{prefix}/depth_{depth_idx}_accuracy"] = float(accuracy.item())
+    return log_data
+
+
+def _format_depth_accuracies(depth_accuracy: torch.Tensor | None, depth_valid: torch.Tensor | None) -> str:
+    if depth_accuracy is None or depth_valid is None:
+        return ""
+    parts = []
+    for depth_idx, (accuracy, valid) in enumerate(zip(depth_accuracy, depth_valid)):
+        if valid.item() > 0:
+            parts.append(f"d{depth_idx}_acc={accuracy.item():.6f}")
+    return " ".join(parts)
 
 
 class TrainEagle3Recipe(BaseRecipe):
@@ -381,6 +424,7 @@ class TrainEagle3Recipe(BaseRecipe):
 
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
+        self.wandb_run = self._build_wandb()
 
         self.rng = StatefulRNG(
             seed=int(recipe_cfg.get("shuffle_seed", 42)),
@@ -432,6 +476,29 @@ class TrainEagle3Recipe(BaseRecipe):
             if isinstance(self.trainer_module, DistributedDataParallel)
             else self.trainer_module
         )
+
+    def _build_wandb(self):
+        if self.cfg.get("wandb", None) is None or not self.dist_env.is_main:
+            return None
+        ok, wandb = safe_import("wandb")
+        if not ok:
+            raise ImportError("The 'wandb' package is required when a top-level wandb config is set.")
+        kwargs = self.cfg.wandb.to_dict()
+        run = wandb.init(
+            **kwargs,
+            config=self.cfg.to_dict(),
+            settings=wandb.Settings(silent=True),
+        )
+        logger.info(
+            "Weights & Biases logging enabled: project=%s name=%s",
+            kwargs.get("project"),
+            kwargs.get("name"),
+        )
+        return run
+
+    def _wandb_log(self, metrics: dict[str, float], step: int) -> None:
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.log(metrics, step=step)
 
     def save_checkpoint(
         self,
@@ -622,6 +689,8 @@ class TrainEagle3Recipe(BaseRecipe):
         total_loss = torch.zeros((), device=self.device)
         total_acc = torch.zeros((), device=self.device)
         total_batches = torch.zeros((), device=self.device)
+        total_depth_correct = None
+        total_depth_valid = None
         with torch.no_grad():
             for batch in self.val_dataloader:
                 batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -640,11 +709,23 @@ class TrainEagle3Recipe(BaseRecipe):
                 total_loss = total_loss + metrics.loss.detach()
                 total_acc = total_acc + metrics.accuracy.detach()
                 total_batches = total_batches + 1
+                if metrics.depth_correct_tokens is not None and metrics.depth_valid_tokens is not None:
+                    if total_depth_correct is None:
+                        total_depth_correct = torch.zeros_like(metrics.depth_correct_tokens.detach())
+                        total_depth_valid = torch.zeros_like(metrics.depth_valid_tokens.detach())
+                    total_depth_correct = total_depth_correct + metrics.depth_correct_tokens.detach()
+                    total_depth_valid = total_depth_valid + metrics.depth_valid_tokens.detach()
         total_loss = _all_reduce_mean(total_loss)
         total_acc = _all_reduce_mean(total_acc)
         total_batches = _all_reduce_mean(total_batches)
+        depth_acc, depth_valid = _reduce_depth_accuracy(total_depth_correct, total_depth_valid)
         self.trainer_module.train()
-        return (total_loss / total_batches.clamp_min(1.0), total_acc / total_batches.clamp_min(1.0))
+        return (
+            total_loss / total_batches.clamp_min(1.0),
+            total_acc / total_batches.clamp_min(1.0),
+            depth_acc,
+            depth_valid,
+        )
 
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
@@ -679,6 +760,8 @@ class TrainEagle3Recipe(BaseRecipe):
 
             running_loss = torch.zeros((), device=self.device)
             running_acc = torch.zeros((), device=self.device)
+            running_depth_correct = None
+            running_depth_valid = None
             running_steps = 0
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -703,6 +786,12 @@ class TrainEagle3Recipe(BaseRecipe):
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
+                if metrics.depth_correct_tokens is not None and metrics.depth_valid_tokens is not None:
+                    if running_depth_correct is None:
+                        running_depth_correct = torch.zeros_like(metrics.depth_correct_tokens.detach())
+                        running_depth_valid = torch.zeros_like(metrics.depth_valid_tokens.detach())
+                    running_depth_correct = running_depth_correct + metrics.depth_correct_tokens.detach()
+                    running_depth_valid = running_depth_valid + metrics.depth_valid_tokens.detach()
                 running_steps += 1
                 batches_processed = batch_idx + 1
                 pending_micro_batches += 1
@@ -718,18 +807,34 @@ class TrainEagle3Recipe(BaseRecipe):
                     if self.runtime.global_step % self.log_every_steps == 0:
                         mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
                         mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                        depth_acc, depth_valid = _reduce_depth_accuracy(running_depth_correct, running_depth_valid)
+                        depth_msg = _format_depth_accuracies(depth_acc, depth_valid)
                         current_lr = self.lr_scheduler.get_last_lr()[0]
                         if self.dist_env.is_main:
                             logger.info(
-                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e",
+                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e%s",
                                 epoch,
                                 self.runtime.global_step,
                                 mean_loss.item(),
                                 mean_acc.item(),
                                 current_lr,
+                                f" {depth_msg}" if depth_msg else "",
+                            )
+                            self._wandb_log(
+                                {
+                                    "train/loss": mean_loss.item(),
+                                    "train/accuracy": mean_acc.item(),
+                                    "train/lr": current_lr,
+                                    "train/epoch": float(epoch),
+                                    **_depth_accuracy_log("train", depth_acc, depth_valid),
+                                },
+                                step=self.runtime.global_step,
                             )
                         running_loss.zero_()
                         running_acc.zero_()
+                        if running_depth_correct is not None:
+                            running_depth_correct.zero_()
+                            running_depth_valid.zero_()
                         running_steps = 0
 
             # Flush the trailing partial accumulation window. When
@@ -760,18 +865,34 @@ class TrainEagle3Recipe(BaseRecipe):
                 if running_steps > 0:
                     mean_loss = _all_reduce_mean(running_loss / max(running_steps, 1))
                     mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
+                    depth_acc, depth_valid = _reduce_depth_accuracy(running_depth_correct, running_depth_valid)
+                    depth_msg = _format_depth_accuracies(depth_acc, depth_valid)
                     current_lr = self.lr_scheduler.get_last_lr()[0]
                     if self.dist_env.is_main:
                         logger.info(
-                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e (trailing flush)",
+                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e (trailing flush)%s",
                             epoch,
                             self.runtime.global_step,
                             mean_loss.item(),
                             mean_acc.item(),
                             current_lr,
+                            f" {depth_msg}" if depth_msg else "",
+                        )
+                        self._wandb_log(
+                            {
+                                "train/loss": mean_loss.item(),
+                                "train/accuracy": mean_acc.item(),
+                                "train/lr": current_lr,
+                                "train/epoch": float(epoch),
+                                **_depth_accuracy_log("train", depth_acc, depth_valid),
+                            },
+                            step=self.runtime.global_step,
                         )
                     running_loss.zero_()
                     running_acc.zero_()
+                    if running_depth_correct is not None:
+                        running_depth_correct.zero_()
+                        running_depth_valid.zero_()
                     running_steps = 0
 
             if self.dist_env.is_main:
@@ -785,16 +906,31 @@ class TrainEagle3Recipe(BaseRecipe):
             eval_metrics = self._run_eval()
             val_loss_dict: dict[str, float] | None = None
             if eval_metrics is not None:
+                val_depth_acc = eval_metrics[2]
+                val_depth_valid = eval_metrics[3]
                 val_loss_dict = {
                     "val_loss": eval_metrics[0].item(),
                     "val_accuracy": eval_metrics[1].item(),
                 }
+                for key, value in _depth_accuracy_log("val", val_depth_acc, val_depth_valid).items():
+                    val_loss_dict[key.replace("/", "_")] = value
                 if self.dist_env.is_main:
+                    depth_msg = _format_depth_accuracies(val_depth_acc, val_depth_valid)
                     logger.info(
-                        "epoch=%s val_loss=%.6f val_acc=%.6f",
+                        "epoch=%s val_loss=%.6f val_acc=%.6f%s",
                         epoch,
                         val_loss_dict["val_loss"],
                         val_loss_dict["val_accuracy"],
+                        f" {depth_msg}" if depth_msg else "",
+                    )
+                    self._wandb_log(
+                        {
+                            "val/loss": val_loss_dict["val_loss"],
+                            "val/accuracy": val_loss_dict["val_accuracy"],
+                            "val/epoch": float(epoch),
+                            **_depth_accuracy_log("val", val_depth_acc, val_depth_valid),
+                        },
+                        step=self.runtime.global_step,
                     )
             self.save_checkpoint(
                 epoch=epoch + 1,
@@ -814,6 +950,8 @@ class TrainEagle3Recipe(BaseRecipe):
 
         if self.dist_env.is_main:
             logger.info("Training complete: global_step=%s", self.runtime.global_step)
+        if getattr(self, "wandb_run", None) is not None:
+            self.wandb_run.finish()
 
 
 def main(config_path=None):

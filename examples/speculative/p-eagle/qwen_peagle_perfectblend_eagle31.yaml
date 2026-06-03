@@ -25,6 +25,12 @@ dist_env:
   backend: nccl
   timeout_minutes: 30
 
+wandb:
+  project: peagle
+  name: qwen3-8b-peagle-eagle31
+  dir: ./outputs/peagle_qwen3_8b_perfectblend_eagle31/wandb
+  mode: offline
+
 recipe_args:
   target_model_name_or_path: Qwen/Qwen3-8B
 
@@ -38,7 +44,7 @@ recipe_args:
   seq_length: 4096
   micro_batch_size: 1
   grad_accumulation_steps: 1
-  num_workers: 8
+  num_workers: 32
   num_epochs: 5
   draft_vocab_size: 32000
   selected_token_ids_path: ./outputs/peagle_qwen3_8b_perfectblend_eagle31/draft_token_map_32000.pt
