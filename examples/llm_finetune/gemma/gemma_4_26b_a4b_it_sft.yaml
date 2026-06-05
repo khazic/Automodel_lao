@@ -1,0 +1,105 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Full-parameter SFT for Gemma-4 26B-A4B MoE (128 experts) on a local chat JSONL.
+# Single node, 8 GPUs: FSDP2 + EP=8 (16 experts per GPU), activation checkpointing.
+#
+# To run this recipe:
+#   torchrun --nproc-per-node=8 examples/llm_finetune/finetune.py --config examples/llm_finetune/gemma/gemma_4_26b_a4b_it_sft.yaml
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  global_batch_size: 8
+  local_batch_size: 1
+  ckpt_every_steps: 200
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1111
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: /llm-align/open_models/gemma4/gemma-4-26B-A4B-it
+  torch_dtype: torch.bfloat16
+  attn_implementation: eager
+  backend:
+    _target_: nemo_automodel.components.models.common.BackendConfig
+    attn: te
+    linear: te
+    rms_norm: te
+    rope_fusion: true
+    dispatcher: deepep
+    fake_balanced_gate: false
+    enable_hf_state_dict_adapter: true
+    enable_fsdp_optimizations: true
+  # 26B-A4B has no kv-shared layers (only 2B/4B do), so disable the cache.
+  text_config:
+    use_cache: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: /llm-align/liuchonghan/runs/gemma4_26b_a4b_sft/checkpoints
+  model_save_format: torch_save     # full-param SFT: DCP shards (pure safetensors is for PEFT only)
+  save_consolidated: true           # also export HF-loadable consolidated safetensors
+
+distributed:
+  strategy: fsdp2
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  ep_size: 8
+  sequence_parallel: false
+  activation_checkpointing: true
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
+  path_or_dataset_id: /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/merged_4files.jsonl
+  seq_length: 2048
+  truncation: true
+  padding: max_length
+
+packed_sequence:
+  packed_sequence_size: 0
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  shuffle: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  betas: [0.9, 0.95]
+  eps: 1e-8
+  lr: 1.0e-5
+  weight_decay: 0.01
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 1.0e-6
+
+# Uncomment for W&B logging (entity is already exported on the server).
+# wandb:
+#   project: gemma4-26b-a4b-sft
+#   name: gemma4_26b_a4b_sft_run1
+#   save_dir: /llm-align/liuchonghan/runs/gemma4_26b_a4b_sft/wandb
