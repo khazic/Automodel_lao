@@ -53,6 +53,9 @@ model:
   # 26B-A4B has no kv-shared layers (only 2B/4B do), so disable the cache.
   text_config:
     use_cache: false
+    # Text-only SFT: disable the vision-aware bidirectional mask so the model
+    # takes the plain causal path and does not require `mm_token_type_ids`.
+    use_bidirectional_attention: null
 
 checkpoint:
   enabled: true
