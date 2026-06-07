@@ -46,8 +46,8 @@ processor:
 checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_26b_a4b_moe_packing/
-  model_save_format: torch_save
-  save_consolidated: false
+  model_save_format: safetensors
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
