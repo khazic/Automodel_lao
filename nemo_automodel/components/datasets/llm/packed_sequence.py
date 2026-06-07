@@ -384,3 +384,35 @@ def packed_block_causal_mask(seq_lens: list[torch.Tensor]):
         _MaskType: BlockMask or Tensor if torch version < 2.5.0.
     """
     return create_block_causal_mask(seq_lens=seq_lens)
+
+
+def build_block_causal_additive_mask(
+    seq_lens: torch.Tensor,
+    *,
+    seq_length: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a ``[B, 1, T, T]`` additive block-causal mask directly on ``device``.
+
+    In-document causal attention is allowed (``0``); cross-document and padding
+    positions are ``finfo(dtype).min``. ``seq_lens`` is the ``[B, max_docs]``
+    0-padded per-document length tensor; each row's non-zero entries sum to
+    ``seq_length`` (trailing pad folded into the final document).
+    """
+    batch_size = seq_lens.shape[0]
+    min_value = torch.finfo(dtype).min
+    # Fully masked, then carve out an in-document lower-triangular block per doc.
+    mask = torch.full((batch_size, seq_length, seq_length), min_value, dtype=dtype, device=device)
+    causal = torch.tril(torch.ones(seq_length, seq_length, dtype=torch.bool, device=device))
+    seq_lens_list = seq_lens.tolist()
+    for b in range(batch_size):
+        offset = 0
+        for doc_len in seq_lens_list[b]:
+            if doc_len <= 0:
+                continue
+            end = offset + doc_len
+            block = causal[offset:end, offset:end]
+            mask[b, offset:end, offset:end] = torch.where(block, torch.zeros((), dtype=dtype, device=device), min_value)
+            offset = end
+    return mask.unsqueeze(1)
