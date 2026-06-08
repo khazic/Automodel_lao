@@ -14,9 +14,9 @@ recipe_args:
   output_dir: ./outputs/peagle_qwen3_8b_perfectblend_kvreuse
   seq_length: 3072
   micro_batch_size: 1
-  grad_accumulation_steps: 1
+  grad_accumulation_steps: 8
   num_workers: 0
-  num_epochs: 20
+  num_epochs: 10
   draft_vocab_size: 32000
 
   selected_token_ids_path: ./cache/peagle_qwen3_8b_draft_token_map_32000.pt
@@ -46,4 +46,5 @@ optimizer:
 
 wandb:
   project: peagle
+  mode: offline
   name: qwen_peagle_perfectblend
