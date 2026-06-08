@@ -21,8 +21,9 @@ recipe: FinetuneRecipeForVLM
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 2000
-  val_every_steps: 500
+  # 207k samples / gbs 8 = ~25.9k steps/epoch; x2 epochs = ~51.8k total steps.
+  # ckpt_every_steps 10000 -> ~5 intermediate checkpoints + final.
+  ckpt_every_steps: 10000
   num_epochs: 2
 
 dist_env:
@@ -97,20 +98,10 @@ dataloader:
     max_length: 2048
     drop_overlong: false
 
-validation_dataset:
-  # Same manifest as train (no separate held-out split yet); swap in a distinct
-  # validation JSONL when you have one.
-  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
-  path_or_dataset: /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/sft_meta.json
-
-validation_dataloader:
-  _target_: torchdata.stateful_dataloader.StatefulDataLoader
-  collate_fn:
-    # default_collate_fn is image-aware only when a turn carries an image; with
-    # text-only conversations it builds labels and skips vision tensors.
-    _target_: nemo_automodel.components.datasets.vlm.collate_fns.default_collate_fn
-    max_length: 2048
-    drop_overlong: false
+# Validation is intentionally disabled: the only manifest available is the full
+# 207k-sample train set, and _run_validation_epoch iterates the WHOLE val
+# dataloader, so validating would run a full 207k forward pass each time. Add a
+# small held-out manifest plus val_every_steps in step_scheduler to re-enable.
 
 optimizer:
   _target_: torch.optim.AdamW
