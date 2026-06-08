@@ -5,9 +5,9 @@ dist_env:
   timeout_minutes: 30
 
 recipe_args:
-  target_model_name_or_path: Qwen/Qwen3-8B
+  target_model_name_or_path: /llm-align/open_models/Qwen3/Qwen3-8B
 
-  train_data_path: /llm-align/liuchonghan/Automodel_lao/cache/perfectblend-qwen3-8b-regen-messages
+  train_data_path: /llm-align/liuchonghan/Automodel_lao/cache/dataset/perfectblend-qwen3-8b-regen-messages
 
   train_split: "train[:70000]"
 
