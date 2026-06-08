@@ -14,7 +14,7 @@ recipe_args:
   output_dir: ./outputs/peagle_qwen3_8b_perfectblend_kvreuse
   seq_length: 3072
   micro_batch_size: 1
-  grad_accumulation_steps: 8
+  grad_accumulation_steps: 1
   num_workers: 0
   num_epochs: 10
   draft_vocab_size: 32000
@@ -36,7 +36,7 @@ recipe_args:
   kv_reuse: true
   kv_reuse_layer_id: 32
 
-  sequence_partitions: 1
+  sequence_partitions: 2
 
 optimizer:
   lr: 1e-4
