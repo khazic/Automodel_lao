@@ -25,6 +25,22 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.speculative.eagle.core import Eagle3StepMetrics
+from nemo_automodel.components.speculative.eagle.peagle_cross_attention import build_cross_additive_mask
+
+
+def _slice_target_kv_row(
+    target_kv: tuple[torch.Tensor, torch.Tensor] | None, row: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Slice one batch row out of the target ``(key, value)`` cache, or pass ``None``.
+
+    Each tensor is ``[B, num_key_value_heads, seq_len, head_dim]``; the row slice
+    keeps the leading batch axis (``[1, ...]``) so it feeds the draft's
+    single-row cross-attention directly.
+    """
+    if target_kv is None:
+        return None
+    key, value = target_kv
+    return key[row : row + 1], value[row : row + 1]
 
 
 def _kl_div_loss(logits: torch.Tensor, target_logits: torch.Tensor) -> torch.Tensor:
@@ -155,12 +171,19 @@ class PEagleTrainerModule(nn.Module):
         loss_mask: torch.Tensor,
         aux_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
+        target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
         peagle_segment: tuple | None = None,
     ) -> Eagle3StepMetrics:
         """Run the P-EAGLE parallel-drafting loss for one batch.
 
         ``attention_mask`` supplies the per-row valid length so padded positions
         are excluded from attention (document mask) and from supervision.
+
+        ``target_kv`` (optional) is the target model's reused ``(key, value)``
+        cache for one layer, each ``[B, num_key_value_heads, seq_len, head_dim]``.
+        When present (KV-reuse enabled) each row's prefix KV is sliced out and fed
+        to the draft's cross-attention; when ``None`` the draft runs the baseline
+        P-EAGLE forward unchanged.
 
         ``peagle_segment`` selects the sequence-partitioning path: when it is a
         ``(plan, index)`` pair (built by :meth:`build_peagle_plan`) this computes
@@ -171,7 +194,7 @@ class PEagleTrainerModule(nn.Module):
         """
         if peagle_segment is not None:
             return self._forward_peagle_segment(
-                input_ids, attention_mask, aux_hidden_states, target_logits, peagle_segment
+                input_ids, attention_mask, aux_hidden_states, target_logits, peagle_segment, target_kv
             )
 
         from nemo_automodel.components.speculative.eagle.peagle_data import generate_cod_sample_indices
@@ -182,6 +205,8 @@ class PEagleTrainerModule(nn.Module):
         loss_den = torch.zeros((), device=input_ids.device, dtype=torch.float32)
         running_correct = torch.zeros((), device=input_ids.device, dtype=torch.float32)
         running_valid = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+        per_depth_correct = torch.zeros(self.num_depths, device=input_ids.device, dtype=torch.float32)
+        per_depth_valid = torch.zeros(self.num_depths, device=input_ids.device, dtype=torch.float32)
 
         for b in range(batch_size):
             row_loss_mask = loss_mask[b : b + 1].long()  # [1, seq_len]
@@ -194,7 +219,7 @@ class PEagleTrainerModule(nn.Module):
             )
             orig_positions = anchor_pos + depth
             row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
-            num, den, correct, valid = self._peagle_position_loss(
+            num, den, correct, valid, pdc, pdv = self._peagle_position_loss(
                 input_ids[b],
                 aux_hidden_states[b : b + 1],
                 target_logits[b],
@@ -204,15 +229,24 @@ class PEagleTrainerModule(nn.Module):
                 row_loss_mask[0, orig_positions].bool(),  # supervision = loss mask at all sampled positions
                 row_length,
                 seq_len,
+                _slice_target_kv_row(target_kv, b),
             )
             loss_num = loss_num + num
             loss_den = loss_den + den
             running_correct = running_correct + correct
             running_valid = running_valid + valid
+            per_depth_correct = per_depth_correct + pdc
+            per_depth_valid = per_depth_valid + pdv
 
         avg_loss = loss_num / loss_den.clamp_min(1e-5)
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss.to(ref_dtype), accuracy=accuracy, valid_tokens=running_valid)
+        return Eagle3StepMetrics(
+            loss=avg_loss.to(ref_dtype),
+            accuracy=accuracy,
+            valid_tokens=running_valid,
+            per_depth_correct=per_depth_correct,
+            per_depth_valid=per_depth_valid,
+        )
 
     def _peagle_position_loss(
         self,
@@ -225,6 +259,7 @@ class PEagleTrainerModule(nn.Module):
         loss_positions: torch.Tensor,  # [n] bool -- positions to charge loss/accuracy on
         row_length: torch.Tensor,  # [1] valid document length
         seq_len: int,
+        target_kv_row: tuple[torch.Tensor, torch.Tensor] | None = None,  # ([1,kvh,seq,hd], ...) or None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Draft forward + count-normalized KL for one row's COD elements.
 
@@ -234,6 +269,11 @@ class PEagleTrainerModule(nn.Module):
         along as key/value context). Returns ``(loss_num, loss_den, correct,
         valid)`` as float scalars, where the loss is ``Σ KL`` over ``loss_positions``
         and ``loss_den`` is their count; the caller normalizes.
+
+        When ``target_kv_row`` is supplied (KV-reuse enabled) the per-element
+        additive cross-attention mask is built here -- each element attends to
+        target positions ``j <= anchor_pos`` of its own document -- and forwarded
+        to the draft alongside the reused KV.
         """
         draft = self.draft_model
         is_depth0 = depth == 0
@@ -258,11 +298,16 @@ class PEagleTrainerModule(nn.Module):
         block_mask = draft.build_peagle_block_mask(
             anchor_pos=anchor_pos, depth=depth, lengths=row_length, total_seq_len=seq_len
         )
+        cross_mask = None
+        if target_kv_row is not None:
+            cross_mask = build_cross_additive_mask(anchor_pos, row_length, seq_len, dtype=mask_hidden_proj.dtype)
         hidden = draft.forward_peagle(
             sampled_input_ids=flat_ids,
             sampled_projected_hidden=flat_hidden,
             position_ids=orig_positions.unsqueeze(0),
             block_mask=block_mask,
+            target_kv=target_kv_row,
+            cross_mask=cross_mask,
         )
         logits = draft.compute_logits(hidden)[0]  # [n, draft_vocab]
 
@@ -278,8 +323,16 @@ class PEagleTrainerModule(nn.Module):
         mask_f = loss_positions.to(elementwise.dtype)
         loss_num = (elementwise * mask_f).sum()
         loss_den = mask_f.sum()
-        correct = ((logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & loss_positions).sum()
-        return loss_num, loss_den, correct.to(loss_num.dtype), loss_den
+        elementwise_correct = (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & loss_positions  # [n]
+        correct = elementwise_correct.sum().to(loss_num.dtype)
+        # Bin top-1 agreement and supervised counts by speculative depth so the
+        # caller can report alpha_k = per_depth_correct / per_depth_valid -- the
+        # step-wise acceptance rate where KV-reuse is expected to help most.
+        per_depth_correct = torch.zeros(self.num_depths, device=loss_num.device, dtype=loss_num.dtype)
+        per_depth_valid = torch.zeros_like(per_depth_correct)
+        per_depth_correct.scatter_add_(0, depth, elementwise_correct.to(loss_num.dtype))
+        per_depth_valid.scatter_add_(0, depth, mask_f.to(loss_num.dtype))
+        return loss_num, loss_den, correct, loss_den, per_depth_correct, per_depth_valid
 
     @torch.no_grad()
     def build_peagle_plan(self, loss_mask: torch.Tensor) -> "_PeaglePlan":
@@ -337,6 +390,7 @@ class PEagleTrainerModule(nn.Module):
         aux_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
         peagle_segment: tuple,
+        target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> Eagle3StepMetrics:
         """Loss for one segment of a :meth:`build_peagle_plan` plan.
 
@@ -351,7 +405,7 @@ class PEagleTrainerModule(nn.Module):
         b, anchor_pos, depth, orig_positions, loss_positions = plan.units[index]
         seq_len = input_ids.shape[1]
         row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
-        num, _den, correct, valid = self._peagle_position_loss(
+        num, _den, correct, valid, pdc, pdv = self._peagle_position_loss(
             input_ids[b],
             aux_hidden_states[b : b + 1],
             target_logits[b],
@@ -361,7 +415,10 @@ class PEagleTrainerModule(nn.Module):
             loss_positions,
             row_length,
             seq_len,
+            _slice_target_kv_row(target_kv, b),
         )
         loss = (num / plan.total_den).to(self.draft_model.masked_projected_hidden().dtype)
         accuracy = correct / valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=loss, accuracy=accuracy, valid_tokens=valid)
+        return Eagle3StepMetrics(
+            loss=loss, accuracy=accuracy, valid_tokens=valid, per_depth_correct=pdc, per_depth_valid=pdv
+        )

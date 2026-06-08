@@ -81,6 +81,17 @@ class PeagleRecipeMixin:
         draft_config["num_hidden_layers"] = draft_num_hidden_layers
         if "layer_types" in draft_config:
             draft_config["layer_types"] = draft_config["layer_types"][:draft_num_hidden_layers]
+        # KV-reuse (experimental): each draft layer cross-attends to the target's
+        # reused KV cache for the verified prefix. Requires the colocated target
+        # backend (it captures the target KV) and a ``kv_reuse_layer_id`` naming a
+        # full-attention target layer; both are validated in ``_setup_colocated_target``.
+        kv_reuse = bool(recipe_cfg.get("kv_reuse", False))
+        draft_config["kv_reuse"] = kv_reuse
+        if kv_reuse and recipe_cfg.get("kv_reuse_layer_id", None) is None:
+            raise ValueError(
+                "kv_reuse=True requires recipe_args.kv_reuse_layer_id (a full-attention target layer index) "
+                "so the target backend knows which layer's KV cache to reuse."
+            )
         return mask_token_id
 
     def build_peagle_trainer(self, recipe_cfg, selected_token_ids, selected_token_mask, mask_token_id):
@@ -144,11 +155,22 @@ class PeagleRecipeMixin:
         loss_sum = torch.zeros((), device=self.device)
         correct_sum = torch.zeros((), device=self.device)
         valid_sum = torch.zeros((), device=self.device)
+        # Per-depth acceptance counts accumulate across segments (the segments
+        # partition the supervised tokens), so summing reproduces the single-pass
+        # per-depth counts. Initialized lazily from the first segment's shape.
+        per_depth_correct = None
+        per_depth_valid = None
         if num_units == 0:
             # Fully-unsupervised batch: still issue one synced backward so the
             # per-rank all-reduce count stays aligned (avoids a DDP hang).
             (sum(p.sum() for p in self.trainer_module.parameters()) * 0.0).backward()
-            return SimpleNamespace(loss=loss_sum, accuracy=correct_sum, valid_tokens=valid_sum)
+            return SimpleNamespace(
+                loss=loss_sum,
+                accuracy=correct_sum,
+                valid_tokens=valid_sum,
+                per_depth_correct=None,
+                per_depth_valid=None,
+            )
 
         for i in range(num_units):
             defer_sync = is_ddp and i < num_units - 1
@@ -159,4 +181,14 @@ class PeagleRecipeMixin:
             loss_sum = loss_sum + seg.loss.detach()
             valid_sum = valid_sum + seg.valid_tokens
             correct_sum = correct_sum + seg.accuracy.detach() * seg.valid_tokens
-        return SimpleNamespace(loss=loss_sum, accuracy=correct_sum / valid_sum.clamp_min(1.0), valid_tokens=valid_sum)
+            if seg.per_depth_correct is not None:
+                pdc, pdv = seg.per_depth_correct.detach(), seg.per_depth_valid.detach()
+                per_depth_correct = pdc if per_depth_correct is None else per_depth_correct + pdc
+                per_depth_valid = pdv if per_depth_valid is None else per_depth_valid + pdv
+        return SimpleNamespace(
+            loss=loss_sum,
+            accuracy=correct_sum / valid_sum.clamp_min(1.0),
+            valid_tokens=valid_sum,
+            per_depth_correct=per_depth_correct,
+            per_depth_valid=per_depth_valid,
+        )

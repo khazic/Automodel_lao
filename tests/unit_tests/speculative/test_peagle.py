@@ -32,8 +32,16 @@ import pytest
 import torch
 from transformers import LlamaConfig
 
-from nemo_automodel.components.speculative.eagle.draft_llama import LlamaEagle3DraftModel
+from nemo_automodel.components.speculative.eagle.draft_llama import (
+    Eagle3LlamaDecoderLayer,
+    Eagle3LlamaPeagleLayer,
+    LlamaEagle3DraftModel,
+)
 from nemo_automodel.components.speculative.eagle.peagle_attention import create_peagle_mask_mod
+from nemo_automodel.components.speculative.eagle.peagle_cross_attention import (
+    PeagleCrossAttention,
+    build_cross_additive_mask,
+)
 from nemo_automodel.components.speculative.eagle.peagle_data import (
     assign_cod_segments,
     generate_cod_sample_indices,
@@ -53,7 +61,7 @@ _gpu_only = pytest.mark.skipif(
 
 
 def _build_tiny_draft_model(
-    *, parallel_drafting: bool = False, mask_token_id: int = 0, device: str = _DEVICE
+    *, parallel_drafting: bool = False, mask_token_id: int = 0, kv_reuse: bool = False, device: str = _DEVICE
 ) -> LlamaEagle3DraftModel:
     config = LlamaConfig(
         hidden_size=32,
@@ -74,6 +82,7 @@ def _build_tiny_draft_model(
     config.draft_vocab_size = 16
     config.target_hidden_size = 32
     config.parallel_drafting = parallel_drafting
+    config.kv_reuse = kv_reuse
     if parallel_drafting:
         config.mask_token_id = mask_token_id
         config.num_depths = 8
@@ -571,6 +580,240 @@ def test_peagle_mvp_example_config_uses_cod_knobs_not_ttt():
     assert "ttt_steps" not in recipe_args.to_dict()
     # P-EAGLE trains the draft embeddings (speculators embed_requires_grad=True).
     assert recipe_args.get("freeze_embeddings") is False
+
+
+# --------------------------------------------------------------------------- #
+# KV-reuse cross-attention (experimental)
+# --------------------------------------------------------------------------- #
+def _cross_config():
+    """Tiny config sharing the draft/target head + rope settings KV-reuse relies on."""
+    config = LlamaConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        max_position_embeddings=64,
+    )
+    config.torch_dtype = torch.float32
+    return config
+
+
+def _random_target_kv(config, *, batch_size, seq_len, device=_DEVICE):
+    """Synthetic target ``(key, value)`` cache: ``[B, num_key_value_heads, seq, head_dim]``."""
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    shape = (batch_size, config.num_key_value_heads, seq_len, head_dim)
+    return torch.randn(shape, device=device), torch.randn(shape, device=device)
+
+
+def test_build_cross_additive_mask_window():
+    """Each element attends to target positions ``j <= anchor`` within the document."""
+    anchor_pos = torch.tensor([0, 2, 3])
+    row_length = torch.tensor([4])  # positions 4,5 are padding
+    mask = build_cross_additive_mask(anchor_pos, row_length, total_seq_len=6, dtype=torch.float32)
+    assert mask.shape == (1, 1, 3, 6)
+    allowed = mask[0, 0] == 0.0
+    # anchor 0 -> only key 0; anchor 2 -> keys 0..2; anchor 3 -> keys 0..3.
+    assert allowed[0].tolist() == [True, False, False, False, False, False]
+    assert allowed[1].tolist() == [True, True, True, False, False, False]
+    assert allowed[2].tolist() == [True, True, True, True, False, False]
+    # Padding key positions (>= row_length=4) are always masked.
+    assert not allowed[:, 4:].any()
+
+
+def test_cross_attention_zero_init_is_noop():
+    """A freshly built cross-attention branch outputs exactly zero (baseline P-EAGLE)."""
+    torch.manual_seed(0)
+    config = _cross_config()
+    cross = PeagleCrossAttention(config).to(dtype=torch.float32)
+    n, seq = 5, 7
+    hidden = torch.randn(1, n, config.hidden_size)
+    position_ids = torch.arange(n).unsqueeze(0)
+    target_kv = _random_target_kv(config, batch_size=1, seq_len=seq, device="cpu")
+    mask = build_cross_additive_mask(torch.arange(n), torch.tensor([seq]), seq, dtype=hidden.dtype)
+    out = cross(hidden, position_ids, target_kv, mask)
+    assert out.shape == hidden.shape
+    assert torch.count_nonzero(out) == 0
+
+
+def test_cross_attention_o_proj_receives_dense_gradient():
+    """o_proj gets gradient at init (zero weight, nonzero grad) so the branch leaves zero.
+
+    The branch's output is zero at init, so the upstream gradient must come from
+    the residual stream it is *added* into (not from the output magnitude). A
+    linear surrogate loss models that nonzero upstream signal; a quadratic loss
+    would be zero-gradient at the zero output and hide the real training dynamics.
+    """
+    torch.manual_seed(0)
+    config = _cross_config()
+    cross = PeagleCrossAttention(config).to(dtype=torch.float32)
+    n, seq = 4, 6
+    hidden = torch.randn(1, n, config.hidden_size, requires_grad=True)
+    position_ids = torch.arange(n).unsqueeze(0)
+    target_kv = _random_target_kv(config, batch_size=1, seq_len=seq, device="cpu")
+    mask = build_cross_additive_mask(torch.arange(n), torch.tensor([seq]), seq, dtype=hidden.dtype)
+    out = cross(hidden, position_ids, target_kv, mask)
+    (out * torch.randn_like(out)).sum().backward()
+    grad = cross.o_proj.weight.grad
+    assert grad is not None and grad.abs().sum().item() > 0, "o_proj got no gradient -- branch would stay starved"
+
+
+def test_cross_attention_respects_causal_window():
+    """An element only attends to target keys ``j <= anchor``: masked keys cannot change its output."""
+    torch.manual_seed(0)
+    config = _cross_config()
+    cross = PeagleCrossAttention(config).to(dtype=torch.float32)
+    with torch.no_grad():
+        cross.o_proj.weight.normal_()  # activate the branch so the output is observable
+    n, seq = 4, 8
+    hidden = torch.randn(1, n, config.hidden_size)
+    position_ids = torch.arange(n).unsqueeze(0)
+    anchor_pos = torch.tensor([0, 1, 2, 3])  # every element's window ends at <= 3
+    mask = build_cross_additive_mask(anchor_pos, torch.tensor([seq]), seq, dtype=hidden.dtype)
+    key, value = _random_target_kv(config, batch_size=1, seq_len=seq, device="cpu")
+
+    out_ref = cross(hidden, position_ids, (key, value), mask)
+    # Perturbing only the masked key positions (4..7) must not move any output.
+    value_perturbed = value.clone()
+    value_perturbed[:, :, 4:, :] = torch.randn_like(value_perturbed[:, :, 4:, :])
+    out_masked = cross(hidden, position_ids, (key, value_perturbed), mask)
+    torch.testing.assert_close(out_ref, out_masked)
+    # Perturbing an allowed key position (0, visible to every element) must move it.
+    value_allowed = value.clone()
+    value_allowed[:, :, 0, :] = torch.randn_like(value_allowed[:, :, 0, :])
+    out_allowed = cross(hidden, position_ids, (key, value_allowed), mask)
+    assert not torch.allclose(out_ref, out_allowed)
+
+
+def test_kv_reuse_builds_cross_attn_only_for_parallel_drafting():
+    """``kv_reuse`` attaches a cross-attention to every P-EAGLE layer; EAGLE-3 stays bare."""
+    peagle = _build_tiny_draft_model(parallel_drafting=True, kv_reuse=True)
+    assert all(layer.cross_attn is not None for layer in peagle.model.layers)
+    assert isinstance(peagle.model.layers[0], Eagle3LlamaDecoderLayer)
+    assert isinstance(peagle.model.layers[1], Eagle3LlamaPeagleLayer)
+
+    plain_peagle = _build_tiny_draft_model(parallel_drafting=True, kv_reuse=False)
+    assert all(layer.cross_attn is None for layer in plain_peagle.model.layers)
+
+    # kv_reuse without parallel drafting must NOT add the branch (EAGLE-3 round-trips).
+    eagle3 = _build_tiny_draft_model(parallel_drafting=False, kv_reuse=True)
+    assert all(layer.cross_attn is None for layer in eagle3.model.layers)
+
+
+def test_kv_reuse_cross_attn_state_dict_round_trip():
+    """The cross-attention weights save and strict-reload into a fresh kv_reuse draft."""
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model(parallel_drafting=True, kv_reuse=True)
+    keys = [k for k in draft.state_dict() if "cross_attn" in k]
+    assert keys, "expected cross_attn weights in the state dict"
+    reloaded = _build_tiny_draft_model(parallel_drafting=True, kv_reuse=True)
+    missing, unexpected = reloaded.load_state_dict(draft.state_dict(), strict=True)
+    assert not missing and not unexpected
+
+
+@_gpu_only
+def test_peagle_kv_reuse_zero_init_matches_baseline_forward():
+    """With zero-init o_proj the KV-reuse forward equals the no-KV forward (branch is a no-op).
+
+    Uses ``batch_size=1`` and a warmup call so flex_attention is already compiled:
+    otherwise the first call's autotuning consumes the CUDA RNG stream between
+    per-row COD draws and the two seeded calls would sample different anchors.
+    """
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model(parallel_drafting=True, kv_reuse=True)
+    trainer = _make_trainer(draft, num_depths=4)
+    batch = _random_batch(draft.config, batch_size=1, seq_len=12)
+    target_kv = _random_target_kv(draft.config, batch_size=1, seq_len=12)
+
+    trainer(**batch)  # warm up flex_attention compilation / autotuning
+    torch.manual_seed(123)
+    baseline = trainer(**batch).loss
+    torch.manual_seed(123)
+    with_kv = trainer(**batch, target_kv=target_kv).loss
+    torch.testing.assert_close(with_kv, baseline, rtol=0, atol=1e-6)
+
+
+@_gpu_only
+def test_peagle_kv_reuse_gradient_reaches_cross_attn():
+    """Driving the forward with target_kv backpropagates into the cross-attention o_proj."""
+    torch.manual_seed(0)
+    draft = _build_tiny_draft_model(parallel_drafting=True, kv_reuse=True)
+    trainer = _make_trainer(draft, num_depths=4)
+    batch = _random_batch(draft.config, batch_size=1, seq_len=12)
+    target_kv = _random_target_kv(draft.config, batch_size=1, seq_len=12)
+
+    trainer(**batch, target_kv=target_kv).loss.backward()
+    grad = draft.model.layers[0].cross_attn.o_proj.weight.grad
+    assert grad is not None and grad.abs().sum().item() > 0, "cross_attn received no gradient"
+
+
+# --------------------------------------------------------------------------- #
+# Per-depth acceptance metrics
+# --------------------------------------------------------------------------- #
+@_gpu_only
+def test_peagle_per_depth_metrics_decompose_aggregate():
+    """Per-depth counts sum back to the aggregate accuracy/valid; depth 0 spans all positions."""
+    torch.manual_seed(0)
+    num_depths = 4
+    draft = _build_tiny_draft_model(parallel_drafting=True)
+    trainer = _make_trainer(draft, num_depths=num_depths)
+    batch = _random_batch(draft.config, batch_size=2, seq_len=12)
+
+    m = trainer(**batch)
+    assert m.per_depth_correct.shape == (num_depths,)
+    assert m.per_depth_valid.shape == (num_depths,)
+    # Summing over depths reproduces the scalar valid count and the aggregate correct count.
+    torch.testing.assert_close(m.per_depth_valid.sum(), m.valid_tokens.to(m.per_depth_valid.dtype))
+    torch.testing.assert_close(m.per_depth_correct.sum(), (m.accuracy * m.valid_tokens).to(m.per_depth_correct.dtype))
+    # Depth 0 keeps every position and the batch is fully supervised (loss_mask all 1).
+    assert m.per_depth_valid[0].item() == batch["input_ids"].numel()
+
+
+@_gpu_only
+def test_peagle_per_depth_partitioned_matches_single():
+    """Per-depth counts summed across sequence-partition segments equal the single flat forward."""
+    torch.manual_seed(0)
+    mask_id = 20
+    draft = _build_tiny_draft_model(parallel_drafting=True, mask_token_id=mask_id)
+    selected_token_ids, selected_token_mask = _vocab_mapping(draft.config)
+
+    def _trainer(sequence_partitions: int) -> PEagleTrainerModule:
+        return PEagleTrainerModule(
+            draft,
+            selected_token_ids=selected_token_ids,
+            selected_token_mask=selected_token_mask,
+            num_depths=6,
+            mask_token_id=mask_id,
+            sequence_partitions=sequence_partitions,
+        ).to(next(draft.parameters()).device)
+
+    single = _trainer(1)
+    partitioned = _trainer(4)
+    batch = _random_batch(draft.config, batch_size=2, seq_len=16)
+
+    torch.manual_seed(123)
+    single_metrics = single(**batch)
+
+    torch.manual_seed(123)
+    plan = partitioned.build_peagle_plan(batch["loss_mask"])
+    pdc = pdv = None
+    for i in range(len(plan.units)):
+        seg = partitioned(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            loss_mask=batch["loss_mask"],
+            aux_hidden_states=batch["aux_hidden_states"],
+            target_logits=batch["target_logits"],
+            peagle_segment=(plan, i),
+        )
+        if seg.per_depth_correct is not None:
+            pdc = seg.per_depth_correct if pdc is None else pdc + seg.per_depth_correct
+            pdv = seg.per_depth_valid if pdv is None else pdv + seg.per_depth_valid
+
+    torch.testing.assert_close(pdv, single_metrics.per_depth_valid)
+    torch.testing.assert_close(pdc, single_metrics.per_depth_correct, rtol=1e-3, atol=1e-4)
 
 
 def test_peagle_checkpoint_save_round_trip(tmp_path):

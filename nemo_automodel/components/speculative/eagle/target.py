@@ -60,6 +60,10 @@ class Eagle3TargetBatch:
     logits: torch.Tensor | None = None
     target_probs: torch.Tensor | None = None
     position_mask: torch.Tensor | None = None
+    # Optional P-EAGLE KV-reuse signal: one target layer's ``(key, value)`` cache,
+    # each ``[B, num_key_value_heads, seq_len, head_dim]``. Present only when the
+    # backend was built with a ``kv_reuse_layer_id``; the draft cross-attends to it.
+    target_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def __post_init__(self) -> None:
         has_logits = self.logits is not None
@@ -85,16 +89,65 @@ class Eagle3TargetBatch:
         else:
             inputs["target_probs"] = self.target_probs
             inputs["position_mask"] = self.position_mask
+        # Forwarded only when KV-reuse is active. Omitted otherwise so trainers
+        # that do not accept ``target_kv`` (EAGLE-3 TTT) keep a valid signature.
+        if self.target_kv is not None:
+            inputs["target_kv"] = self.target_kv
         return inputs
 
 
-class HFEagle3TargetModel(Eagle3TargetBackend):
-    """Co-located backend that captures three auxiliary hidden states from a causal LM."""
+def _extract_layer_kv(past_key_values, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pull one layer's ``(key, value)`` out of an HF KV cache (P-EAGLE KV-reuse).
 
-    def __init__(self, model: nn.Module, aux_layer_ids: Sequence[int] | None = None):
+    Handles the cache layouts transformers has shipped: the legacy
+    ``tuple[(k, v), ...]`` per layer, the ``DynamicCache`` with ``key_cache`` /
+    ``value_cache`` lists, and the newer per-layer ``cache.layers[i].keys/values``.
+    Keys already carry the target's absolute-position RoPE. The tensors are
+    detached (the target is frozen) and returned as ``[B, kv_heads, seq, head_dim]``.
+    """
+    if past_key_values is None:
+        raise RuntimeError(
+            "kv_reuse is enabled but the target returned no past_key_values; the target forward must run with "
+            "use_cache=True and expose a KV cache (a custom AutoModel impl that drops the cache is unsupported)."
+        )
+    if isinstance(past_key_values, (tuple, list)):
+        key, value = past_key_values[layer_id][0], past_key_values[layer_id][1]
+    elif hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        key, value = past_key_values.key_cache[layer_id], past_key_values.value_cache[layer_id]
+    elif hasattr(past_key_values, "layers"):
+        layer = past_key_values.layers[layer_id]
+        key, value = layer.keys, layer.values
+    else:
+        raise RuntimeError(f"Unsupported KV cache type {type(past_key_values).__name__} for kv_reuse extraction.")
+    return key.detach(), value.detach()
+
+
+class HFEagle3TargetModel(Eagle3TargetBackend):
+    """Co-located backend that captures three auxiliary hidden states from a causal LM.
+
+    When ``kv_reuse_layer_id`` is set, the target also runs with ``use_cache=True``
+    and the backend captures that layer's ``(key, value)`` cache, exposed on
+    :attr:`Eagle3TargetBatch.target_kv` for the P-EAGLE KV-reuse cross-attention.
+    Pick a *full-attention* layer (a sliding-window layer's cache is truncated).
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        aux_layer_ids: Sequence[int] | None = None,
+        kv_reuse_layer_id: int | None = None,
+    ):
         self.model = model.eval()
         candidate_ids = list(aux_layer_ids) if aux_layer_ids is not None else self._default_aux_layer_ids()
         self.aux_layer_ids = self._validate_aux_layer_ids(candidate_ids)
+        if kv_reuse_layer_id is not None:
+            num_layers = self.model.config.num_hidden_layers
+            if not 0 <= int(kv_reuse_layer_id) < num_layers:
+                raise ValueError(
+                    f"kv_reuse_layer_id={kv_reuse_layer_id} is out of bounds for a target with {num_layers} layers."
+                )
+            kv_reuse_layer_id = int(kv_reuse_layer_id)
+        self.kv_reuse_layer_id = kv_reuse_layer_id
 
     def _default_aux_layer_ids(self) -> list[int]:
         # EAGLE-3 default 3-layer recipe (low / mid / high).
@@ -194,10 +247,12 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         # ``attention_mask``, ``position_ids``, ``padding_mask`` and a
         # ``**attn_kwargs`` catch-all; the HF flags below mean nothing to
         # them and are dropped to keep the call site honest.
+        want_cache = self.kv_reuse_layer_id is not None
         forward_params = inspect.signature(self.model.forward).parameters
-        extra_kwargs = {
-            name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
-        }
+        extra_kwargs = {name: False for name in ("output_hidden_states", "output_attentions") if name in forward_params}
+        # KV-reuse needs the target KV cache, so request it instead of suppressing it.
+        if "use_cache" in forward_params:
+            extra_kwargs["use_cache"] = want_cache
 
         try:
             outputs = self.model(
@@ -221,10 +276,17 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         shifted_logits = _shift_left_with_zero(target_logits)
         shifted_input_ids = _shift_left_with_zero(input_ids)
         shifted_loss_mask = _shift_left_with_zero(loss_mask)
+        # Target KV is indexed by absolute (unshifted) position -- it aligns with
+        # aux_hidden_states, not the left-shifted supervision tensors -- so it is
+        # captured as-is and the draft's cross-attention mask indexes it directly.
+        target_kv = (
+            _extract_layer_kv(getattr(outputs, "past_key_values", None), self.kv_reuse_layer_id) if want_cache else None
+        )
         return Eagle3TargetBatch(
             aux_hidden_states=aux_hidden_states,
             logits=shifted_logits,
             input_ids=shifted_input_ids,
             attention_mask=attention_mask,
             loss_mask=shifted_loss_mask,
+            target_kv=target_kv,
         )

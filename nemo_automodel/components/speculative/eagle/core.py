@@ -46,11 +46,19 @@ def _compute_target_distribution(
 
 @dataclass
 class Eagle3StepMetrics:
-    """Aggregated metrics from one EAGLE-3 training step."""
+    """Aggregated metrics from one EAGLE-3 training step.
+
+    ``per_depth_correct`` / ``per_depth_valid`` are optional ``[num_depths]``
+    tensors of the top-1 agreement counts split by speculative depth (the
+    step-wise acceptance rate ``alpha_k = correct_k / valid_k``). Only the
+    P-EAGLE trainer populates them; the EAGLE-3 TTT trainer leaves them ``None``.
+    """
 
     loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    per_depth_correct: torch.Tensor | None = None
+    per_depth_valid: torch.Tensor | None = None
 
 
 class Eagle3TrainerModule(nn.Module):

@@ -104,6 +104,7 @@ from nemo_automodel.components.models.llama.rope_utils import (
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from nemo_automodel.components.speculative.eagle.peagle_cross_attention import PeagleCrossAttention
 from nemo_automodel.components.speculative.eagle.peagle_draft import (
     _PeagleAttentionMixin,
     _PeagleDecoderLayerMixin,
@@ -113,6 +114,18 @@ from nemo_automodel.components.speculative.eagle.peagle_draft import (
 from nemo_automodel.shared.import_utils import safe_import_from
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_build_cross_attention(config: PretrainedConfig) -> nn.Module | None:
+    """Build the P-EAGLE KV-reuse cross-attention branch when enabled.
+
+    Returns a :class:`PeagleCrossAttention` only when ``config.kv_reuse`` is set
+    on a ``parallel_drafting`` draft; otherwise ``None`` so EAGLE-3 / plain
+    P-EAGLE layers carry no extra parameters and their checkpoints round-trip.
+    """
+    if getattr(config, "kv_reuse", False) and getattr(config, "parallel_drafting", False):
+        return PeagleCrossAttention(config)
+    return None
 
 
 def _load_flash_attn_func() -> tuple[bool, object | None]:
@@ -447,6 +460,9 @@ class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
         )
         self.self_attn = Eagle3LlamaAttention(config)
         self.mlp = Eagle3LlamaMLP(config)
+        # P-EAGLE KV-reuse: optional cross-attention to the target prefix KV,
+        # added as a zero-initialized residual correction in ``forward_peagle``.
+        self.cross_attn = _maybe_build_cross_attention(config)
 
     def forward(
         self,
@@ -496,6 +512,9 @@ class Eagle3LlamaPeagleLayer(_PeagleVanillaLayerMixin, nn.Module):
         )
         self.self_attn = Eagle3LlamaAttention(config, fuse_input=False)
         self.mlp = Eagle3LlamaMLP(config)
+        # P-EAGLE KV-reuse: optional cross-attention to the target prefix KV,
+        # added as a zero-initialized residual correction in ``forward_peagle``.
+        self.cross_attn = _maybe_build_cross_attention(config)
 
 
 class Eagle3LlamaModel(nn.Module):
@@ -598,6 +617,18 @@ class LlamaEagle3DraftModel(_PeagleDraftMixin, PreTrainedModel):
             self._init_peagle_parameters(config)
 
         self.post_init()
+
+        # ``post_init`` runs HF ``_init_weights`` over every ``nn.Linear``, which
+        # re-randomizes the cross-attention output projection that
+        # ``PeagleCrossAttention.__init__`` zero-initialized. Re-zero it here, after
+        # post_init, so the KV-reuse branch genuinely starts as a no-op (the drafter
+        # reduces to baseline P-EAGLE at init -- see ``PeagleCrossAttention``).
+        if getattr(config, "kv_reuse", False) and getattr(config, "parallel_drafting", False):
+            for layer in self.model.layers:
+                if getattr(layer, "cross_attn", None) is not None:
+                    nn.init.zeros_(layer.cross_attn.o_proj.weight)
+                    if layer.cross_attn.o_proj.bias is not None:
+                        nn.init.zeros_(layer.cross_attn.o_proj.bias)
 
     def copy_embeddings_from_target(self, target_embedding: nn.Embedding) -> None:
         """Initialize draft embeddings from the target model embeddings.

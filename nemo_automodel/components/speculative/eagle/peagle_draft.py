@@ -96,19 +96,25 @@ class _PeagleDecoderLayerMixin:
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         block_mask,
+        target_kv=None,
+        cross_mask=None,
     ) -> torch.Tensor:
         """Decoder-layer variant for the P-EAGLE single parallel forward.
 
         Mirrors :meth:`forward` (same norms, residuals, MLP and ``[embeds,
         hidden]`` concatenation) but routes attention through
         ``self_attn.forward_peagle`` with a COD ``block_mask`` instead of the
-        ``cache_hidden`` recurrence.
+        ``cache_hidden`` recurrence. When KV-reuse is enabled (``self.cross_attn``
+        present and ``target_kv`` supplied) a zero-initialized cross-attention to
+        the target prefix KV is added as a residual correction before the MLP.
         """
         residual = hidden_states
         norm_input_embeds = self.input_layernorm(input_embeds)
         norm_hidden_states = self.hidden_norm(hidden_states)
         combined_states = torch.cat((norm_input_embeds, norm_hidden_states), dim=-1)
         hidden_states = residual + self.self_attn.forward_peagle(combined_states, position_ids, block_mask)
+        if self.cross_attn is not None and target_kv is not None:
+            hidden_states = hidden_states + self.cross_attn(hidden_states, position_ids, target_kv, cross_mask)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -124,11 +130,20 @@ class _PeagleVanillaLayerMixin:
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         block_mask,
+        target_kv=None,
+        cross_mask=None,
     ) -> torch.Tensor:
-        """Standard pre-norm Llama block over ``H`` hidden states with the COD mask."""
+        """Standard pre-norm Llama block over ``H`` hidden states with the COD mask.
+
+        When KV-reuse is enabled (``self.cross_attn`` present and ``target_kv``
+        supplied) a zero-initialized cross-attention to the target prefix KV is
+        added as a residual correction before the MLP.
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = residual + self.self_attn.forward_peagle(hidden_states, position_ids, block_mask)
+        if self.cross_attn is not None and target_kv is not None:
+            hidden_states = hidden_states + self.cross_attn(hidden_states, position_ids, target_kv, cross_mask)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -178,6 +193,8 @@ class _PeagleDraftMixin:
         sampled_projected_hidden: torch.Tensor,
         position_ids: torch.Tensor,
         block_mask,
+        target_kv=None,
+        cross_mask=None,
     ) -> torch.Tensor:
         """Run the P-EAGLE single parallel-group forward.
 
@@ -191,6 +208,11 @@ class _PeagleDraftMixin:
         * ``position_ids`` -- ``anchor_pos + depth`` (the reference position);
         * ``block_mask`` -- the COD cross-depth visibility mask.
 
+        When KV-reuse is enabled the caller also passes ``target_kv`` (the target
+        prefix ``(key, value)`` for this row) and ``cross_mask`` (the additive
+        ``j <= anchor`` window); both are forwarded to every layer's
+        cross-attention branch.
+
         Returns the pre-logits hidden states (post-``norm`` when
         ``config.norm_output`` is set), one row per sampled element.
         """
@@ -201,9 +223,11 @@ class _PeagleDraftMixin:
             hidden_states=sampled_projected_hidden,
             position_ids=position_ids,
             block_mask=block_mask,
+            target_kv=target_kv,
+            cross_mask=cross_mask,
         )
         for layer in self.model.layers[1:]:
-            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask)
+            hidden_states = layer.forward_peagle(hidden_states, position_ids, block_mask, target_kv, cross_mask)
         if getattr(self.config, "norm_output", False):
             hidden_states = self.model.norm(hidden_states)
         return hidden_states

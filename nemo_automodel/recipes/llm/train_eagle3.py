@@ -119,6 +119,28 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
+def _all_reduce_sum(value: torch.Tensor) -> torch.Tensor:
+    """Sum a tensor across ranks in place-safe fashion (single process: no-op).
+
+    Used for per-depth acceptance counts, where the cross-rank reduction must be
+    a SUM of counts (then divided after) rather than a mean of per-rank ratios.
+    """
+    if dist.is_available() and dist.is_initialized():
+        value = value.clone()
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    return value
+
+
+def _per_depth_accept_rates(correct: torch.Tensor, valid: torch.Tensor) -> dict[str, float]:
+    """Build a ``{accept@k: alpha_k}`` dict from summed per-depth correct/valid counts.
+
+    ``alpha_k`` is the step-wise top-1 acceptance rate at speculative depth ``k``;
+    a depth with no supervised tokens reports 0.0 (its ``valid`` count is clamped).
+    """
+    rates = (correct / valid.clamp_min(1.0)).tolist()
+    return {f"accept@{k}": float(rate) for k, rate in enumerate(rates)}
+
+
 class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
     """Recipe for EAGLE-3 training on Llama-style dense LLMs (Llama, Phi-3, Qwen3) and MoE backbones (Qwen3-MoE)."""
 
@@ -433,13 +455,23 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         # the draft trainer module). Mark the parameters explicitly so no future
         # code path accidentally trains the target -- matching EAGLE-1/2.
         self.target_model.requires_grad_(False)
+        # KV-reuse only captures the target KV when both parallel drafting and
+        # kv_reuse are on; otherwise the backend runs the unchanged EAGLE-3 path.
+        kv_reuse = bool(recipe_cfg.get("kv_reuse", False)) and bool(recipe_cfg.get("parallel_drafting", False))
+        kv_reuse_layer_id = int(recipe_cfg.get("kv_reuse_layer_id")) if kv_reuse else None
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            kv_reuse_layer_id=kv_reuse_layer_id,
         )
 
     def _setup_remote_target(self, recipe_cfg):
         """Connect to one or more remote target servers (no target loaded here)."""
+        if recipe_cfg.get("kv_reuse", False):
+            raise NotImplementedError(
+                "kv_reuse is only supported with target_model_backend='colocated'; the remote backend does not "
+                "transfer the target KV cache."
+            )
         urls = recipe_cfg.get("remote_urls", None)
         if not urls and recipe_cfg.get("remote_url", None):
             urls = [recipe_cfg.remote_url]
@@ -484,6 +516,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         """
         from nemo_automodel.components.datasets.llm.eagle3_cache import read_target_embeddings
 
+        if recipe_cfg.get("kv_reuse", False):
+            raise NotImplementedError(
+                "kv_reuse requires the live colocated target (it captures the target KV cache); the offline "
+                "cached_target_path path does not store KV."
+            )
         self.target_model = None
         self.target_wrapper = None
         manifest = read_manifest(self.cached_target_path)
@@ -873,15 +910,32 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         total_loss = torch.zeros((), device=self.device)
         total_acc = torch.zeros((), device=self.device)
         total_batches = torch.zeros((), device=self.device)
+        # Per-depth acceptance (P-EAGLE only): accumulate raw counts over the whole
+        # val set, then reduce as SUM-of-counts so alpha_k is a true held-out rate
+        # -- the metric that exposes whether KV-reuse helps at longer depths.
+        per_depth_correct = None
+        per_depth_valid = None
         with torch.no_grad():
             for batch in self.val_dataloader:
                 metrics = self._forward_batch(batch)
                 total_loss = total_loss + metrics.loss.detach()
                 total_acc = total_acc + metrics.accuracy.detach()
                 total_batches = total_batches + 1
+                if getattr(metrics, "per_depth_correct", None) is not None:
+                    pdc, pdv = metrics.per_depth_correct.detach(), metrics.per_depth_valid.detach()
+                    per_depth_correct = pdc if per_depth_correct is None else per_depth_correct + pdc
+                    per_depth_valid = pdv if per_depth_valid is None else per_depth_valid + pdv
         total_loss = _all_reduce_mean(total_loss)
         total_acc = _all_reduce_mean(total_acc)
         total_batches = _all_reduce_mean(total_batches)
+        if per_depth_correct is not None:
+            rates = _per_depth_accept_rates(_all_reduce_sum(per_depth_correct), _all_reduce_sum(per_depth_valid))
+            if self.dist_env.is_main:
+                logger.info(
+                    "val per-depth acceptance: %s",
+                    " ".join(f"{k}={v:.4f}" for k, v in rates.items()),
+                )
+                self._wandb_log({f"val/{k}": v for k, v in rates.items()}, step=self.runtime.global_step)
         self.trainer_module.train()
         return (total_loss / total_batches.clamp_min(1.0), total_acc / total_batches.clamp_min(1.0))
 
@@ -890,6 +944,58 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         run = getattr(self, "wandb_run", None)
         if run is not None:
             run.log(data, step=step)
+
+    def _log_train_per_depth(self, correct, valid) -> None:
+        """Log per-depth training acceptance (``alpha_k``) for the logging window.
+
+        ``correct`` / ``valid`` are the per-rank per-depth count tensors summed
+        over the window (or ``None`` outside P-EAGLE). They are sum-reduced
+        across ranks, turned into ``alpha_k`` rates, printed on rank 0, and
+        mirrored to W&B under ``train/accept@k``. A no-op when ``correct`` is
+        ``None``.
+        """
+        if correct is None:
+            return
+        correct = _all_reduce_sum(correct)
+        valid = _all_reduce_sum(valid)
+        rates = _per_depth_accept_rates(correct, valid)
+        if self.dist_env.is_main:
+            counts = valid.tolist()
+            logger.info(
+                "  train per-depth acceptance: %s",
+                " ".join(f"{k}={v:.4f}" for k, v in rates.items()),
+            )
+            logger.info(
+                "  train per-depth valid-count: %s",
+                " ".join(f"{k}={int(n)}" for k, n in enumerate(counts)),
+            )
+            self._wandb_log({f"train/{k}": v for k, v in rates.items()}, step=self.runtime.global_step)
+
+    def _log_cross_attn_norms(self) -> None:
+        """Log each KV-reuse cross-attention's ``o_proj`` weight norm (rank 0).
+
+        ``o_proj`` is zero-initialized, so its Frobenius norm is the activation
+        signal: staying ~0 means the cross-attention branch is inert (the run is
+        effectively baseline P-EAGLE); a growing norm means the reused target KV
+        is contributing. A no-op when KV-reuse is off (no ``cross_attn`` modules).
+        """
+        if not self.dist_env.is_main:
+            return
+        layers = getattr(getattr(self.draft_model, "model", None), "layers", None)
+        if layers is None:
+            return
+        norms = []
+        for i, layer in enumerate(layers):
+            cross_attn = getattr(layer, "cross_attn", None)
+            if cross_attn is not None:
+                norms.append((i, float(cross_attn.o_proj.weight.detach().norm())))
+        if not norms:
+            return
+        logger.info(
+            "  cross_attn o_proj norm: %s",
+            " ".join(f"L{i}={n:.4f}" for i, n in norms),
+        )
+        self._wandb_log({f"train/cross_attn_norm/L{i}": n for i, n in norms}, step=self.runtime.global_step)
 
     def run_train_validation_loop(self):
         """Run the minimal EAGLE-3 train loop."""
@@ -925,6 +1031,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
             running_loss = torch.zeros((), device=self.device)
             running_acc = torch.zeros((), device=self.device)
+            # Per-depth acceptance counts accumulate over the same logging window
+            # as running_loss/running_acc. Lazily initialized from the first
+            # metrics shape (None until a P-EAGLE step reports per-depth counts).
+            running_pd_correct = None
+            running_pd_valid = None
             running_steps = 0
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -961,6 +1072,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
+                if getattr(metrics, "per_depth_correct", None) is not None:
+                    pdc, pdv = metrics.per_depth_correct.detach(), metrics.per_depth_valid.detach()
+                    running_pd_correct = pdc if running_pd_correct is None else running_pd_correct + pdc
+                    running_pd_valid = pdv if running_pd_valid is None else running_pd_valid + pdv
                 running_steps += 1
                 batches_processed = batch_idx + 1
                 pending_micro_batches += 1
@@ -997,8 +1112,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                                 },
                                 step=self.runtime.global_step,
                             )
+                        self._log_train_per_depth(running_pd_correct, running_pd_valid)
+                        self._log_cross_attn_norms()
                         running_loss.zero_()
                         running_acc.zero_()
+                        running_pd_correct = None
+                        running_pd_valid = None
                         running_steps = 0
 
             # Flush the trailing partial accumulation window. When
@@ -1050,8 +1169,11 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                             },
                             step=self.runtime.global_step,
                         )
+                    self._log_train_per_depth(running_pd_correct, running_pd_valid)
                     running_loss.zero_()
                     running_acc.zero_()
+                    running_pd_correct = None
+                    running_pd_valid = None
                     running_steps = 0
 
             if self.dist_env.is_main:
