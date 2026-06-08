@@ -17,11 +17,11 @@ dist_env:
 
 recipe_args:
   target_model_name_or_path: Qwen/Qwen3-8B
-  train_data_path: /path/to/perfectblend_qwen3-8b_regen.jsonl   # regenerate responses with the target model first
+  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen/data
   val_data_path: null
   output_dir: ./outputs/dflash_qwen3_8b
-  seq_length: 3072
-  micro_batch_size: 4
+  seq_length: 4096
+  micro_batch_size: 1
   grad_accumulation_steps: 1
   num_workers: 4
   num_epochs: 6
@@ -31,10 +31,8 @@ recipe_args:
   block_size: 16                      # tokens drafted in parallel per block
   num_anchors: 512                    # blocks sampled per sequence per step
   loss_decay_gamma: 7.0               # block-position loss decay: exp(-(k-1)/gamma)
-  # mask_token_id: 151669             # token used for non-anchor block positions
-  #                                   # (defaults to the tokenizer pad token if unset)
-  # target_layer_ids: [1, 9, 17, 25, 33]   # target layers captured as draft context
-  #                                   # (defaults to an even spread across the target)
+  mask_token_id: 151669               # matches SpecForge qwen3-8b-dflash.json
+  target_layer_ids: [1, 9, 17, 25, 33]   # target layers captured as draft context
   attention_backend: flex_attention   # "flex_attention" (GPU main path) or "sdpa" (portable fallback)
 
   trust_remote_code: false
@@ -43,7 +41,7 @@ recipe_args:
   max_grad_norm: 1.0
 
   # --- checkpoint cadence (independent; the fully-trained model is always saved) ---
-  # ckpt_every_steps: 1000            # also save every N optimizer steps
+  ckpt_every_steps: 300000           # also save every N optimizer steps
   # save_checkpoint_every_epoch: false
 
 optimizer:
