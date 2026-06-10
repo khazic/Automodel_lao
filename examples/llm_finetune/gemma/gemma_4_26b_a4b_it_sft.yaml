@@ -23,7 +23,7 @@ recipe: TrainFinetuneRecipeForNextTokenPrediction
 step_scheduler:
   global_batch_size: 8
   local_batch_size: 1
-  ckpt_every_steps: 200
+  ckpt_every_steps: 1000
   num_epochs: 1
 
 dist_env:
@@ -60,8 +60,12 @@ model:
 checkpoint:
   enabled: true
   checkpoint_dir: /llm-align/liuchonghan/runs/gemma4_26b_a4b_sft/checkpoints
-  model_save_format: torch_save     # full-param SFT: DCP shards (pure safetensors is for PEFT only)
-  save_consolidated: true           # also export HF-loadable consolidated safetensors
+  # HF-format checkpoints: every save writes HF-named sharded safetensors;
+  # `final` additionally consolidates the last checkpoint into HF-loadable
+  # files inline. Intermediate saves can be consolidated offline with
+  # `bash <checkpoint>/model/consolidate.sh` (avoids idling GPUs every save).
+  model_save_format: safetensors
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
