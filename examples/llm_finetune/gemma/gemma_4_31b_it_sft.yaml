@@ -82,7 +82,7 @@ loss_fn:
 
 dataset:
   _target_: nemo_automodel.components.datasets.llm.chat_dataset.ChatDataset
-  path_or_dataset_id: /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/merged_4files_filtered.jsonl
+  path_or_dataset_id: /llm-align/liuchonghan/ins_dataset/ins_dataset/dayuzhong/dyz_sft_data_converted.jsonl
   seq_length: 2048
   truncation: true
   padding: max_length
