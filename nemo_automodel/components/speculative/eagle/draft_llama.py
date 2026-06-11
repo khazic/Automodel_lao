@@ -521,6 +521,14 @@ class Eagle3LlamaDecoderLayer(_PeagleDecoderLayerMixin, nn.Module):
         )
         self.self_attn = Eagle3LlamaAttention(config)
         self.mlp = Eagle3LlamaMLP(config)
+        if getattr(config, "kv_reuse", False):
+            from nemo_automodel.components.speculative.eagle.peagle_cross_attention import (
+                PeagleCrossAttention,
+                PeagleGatedMerge,
+            )
+
+            self.cross_attn = PeagleCrossAttention(config)
+            self.gate = PeagleGatedMerge(config)
 
     def forward(
         self,
@@ -574,6 +582,14 @@ class Eagle3LlamaPeagleLayer(_PeagleVanillaLayerMixin, nn.Module):
         )
         self.self_attn = Eagle3LlamaAttention(config, fuse_input=False)
         self.mlp = Eagle3LlamaMLP(config)
+        if getattr(config, "kv_reuse", False):
+            from nemo_automodel.components.speculative.eagle.peagle_cross_attention import (
+                PeagleCrossAttention,
+                PeagleGatedMerge,
+            )
+
+            self.cross_attn = PeagleCrossAttention(config)
+            self.gate = PeagleGatedMerge(config)
 
 
 class Eagle3LlamaModel(nn.Module):

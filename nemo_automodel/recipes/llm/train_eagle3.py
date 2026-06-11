@@ -463,6 +463,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         self.target_wrapper = HFEagle3TargetModel(
             self.target_model,
             aux_layer_ids=recipe_cfg.get("aux_layer_ids", None),
+            kv_reuse_layer_ids=recipe_cfg.get("kv_reuse_layer_ids", None),
         )
 
     def _setup_remote_target(self, recipe_cfg):

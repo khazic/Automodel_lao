@@ -102,20 +102,31 @@ class _PeagleDecoderLayerMixin:
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         block_mask,
+        target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cross_block_mask=None,
     ) -> torch.Tensor:
         """Decoder-layer variant for the P-EAGLE single parallel forward.
 
         Mirrors :meth:`forward` (same norms, residuals, MLP and ``[embeds,
         hidden]`` concatenation) but routes attention through
         ``self_attn.forward_peagle`` with a COD ``block_mask`` instead of the
-        ``cache_hidden`` recurrence.
+        ``cache_hidden`` recurrence. When ``target_kv`` is provided and the
+        layer has ``cross_attn``, a gated cross-attention correction is applied.
         """
         residual = hidden_states
         norm_input_embeds = self.input_layernorm(input_embeds)
         norm_hidden_states = self.hidden_norm(hidden_states)
         combined_states = torch.cat((norm_input_embeds, norm_hidden_states), dim=-1)
-        hidden_states = residual + self.self_attn.forward_peagle(combined_states, position_ids, block_mask)
+        self_attn_out = self.self_attn.forward_peagle(combined_states, position_ids, block_mask)
 
+        if target_kv is not None and hasattr(self, "cross_attn"):
+            target_k, target_v = target_kv
+            cross_attn_out = self.cross_attn(norm_hidden_states, target_k, target_v, position_ids, cross_block_mask)
+            merged = self.gate(self_attn_out, cross_attn_out)
+        else:
+            merged = self_attn_out
+
+        hidden_states = residual + merged
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + self.mlp(hidden_states)
@@ -130,12 +141,26 @@ class _PeagleVanillaLayerMixin:
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         block_mask,
+        target_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        cross_block_mask=None,
     ) -> torch.Tensor:
-        """Standard pre-norm Llama block over ``H`` hidden states with the COD mask."""
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn.forward_peagle(hidden_states, position_ids, block_mask)
+        """Standard pre-norm Llama block over ``H`` hidden states with the COD mask.
 
+        When ``target_kv`` is provided and the layer has ``cross_attn``, a gated
+        cross-attention correction is applied after self-attention.
+        """
+        residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+        self_attn_out = self.self_attn.forward_peagle(normed, position_ids, block_mask)
+
+        if target_kv is not None and hasattr(self, "cross_attn"):
+            target_k, target_v = target_kv
+            cross_attn_out = self.cross_attn(normed, target_k, target_v, position_ids, cross_block_mask)
+            merged = self.gate(self_attn_out, cross_attn_out)
+        else:
+            merged = self_attn_out
+
+        hidden_states = residual + merged
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + self.mlp(hidden_states)
@@ -200,6 +225,8 @@ class _PeagleDraftMixin:
         sampled_projected_hidden: torch.Tensor,
         position_ids: torch.Tensor,
         block_mask,
+        target_kv_list: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        cross_block_mask=None,
     ) -> torch.Tensor:
         """Run the P-EAGLE single parallel-group forward.
 
@@ -212,11 +239,14 @@ class _PeagleDraftMixin:
           depth-0 slots, the projected ``mask_hidden`` placeholder elsewhere;
         * ``position_ids`` -- ``anchor_pos + depth`` (the reference position);
         * ``block_mask`` -- the COD cross-depth visibility mask.
+        * ``target_kv_list`` -- per-layer (K, V) from target attention layers.
+        * ``cross_block_mask`` -- flex_attention mask for cross-attention.
 
         Returns the pre-logits hidden states (post-``norm`` when
         ``config.norm_output`` is set), one row per sampled element.
         """
         draft_input_embeds = self.embed_input_ids(sampled_input_ids)
+        layer0_kv = target_kv_list[0] if target_kv_list else None
         # Layer 0 fuses ``[embed, hidden]`` (2H); deeper layers refine plain H.
         hidden_states = self._run_draft_layer(
             self.model.layers[0].forward_peagle,
@@ -224,9 +254,19 @@ class _PeagleDraftMixin:
             hidden_states=sampled_projected_hidden,
             position_ids=position_ids,
             block_mask=block_mask,
+            target_kv=layer0_kv,
+            cross_block_mask=cross_block_mask,
         )
-        for layer in self.model.layers[1:]:
-            hidden_states = self._run_draft_layer(layer.forward_peagle, hidden_states, position_ids, block_mask)
+        for i, layer in enumerate(self.model.layers[1:], start=1):
+            layer_kv = target_kv_list[i] if target_kv_list and i < len(target_kv_list) else None
+            hidden_states = self._run_draft_layer(
+                layer.forward_peagle,
+                hidden_states,
+                position_ids,
+                block_mask,
+                target_kv=layer_kv,
+                cross_block_mask=cross_block_mask,
+            )
         if getattr(self.config, "norm_output", False):
             hidden_states = self.model.norm(hidden_states)
         return hidden_states

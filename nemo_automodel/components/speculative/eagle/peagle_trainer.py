@@ -156,6 +156,7 @@ class PEagleTrainerModule(nn.Module):
         aux_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
         peagle_segment: tuple | None = None,
+        target_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> Eagle3StepMetrics:
         """Run the P-EAGLE parallel-drafting loss for one batch.
 
@@ -168,10 +169,13 @@ class PEagleTrainerModule(nn.Module):
         segment and owns the ``backward()`` so DDP's gradient sync stays correct.
         When ``None`` (``sequence_partitions == 1`` and eval) a single flat
         forward over the whole COD sequence returns a grad-carrying loss.
+
+        ``target_kv`` is an optional list of (K, V) tuples from target attention
+        layers for cross-attention KV reuse. Each K/V is [B, num_kv_heads, T, head_dim].
         """
         if peagle_segment is not None:
             return self._forward_peagle_segment(
-                input_ids, attention_mask, aux_hidden_states, target_logits, peagle_segment
+                input_ids, attention_mask, aux_hidden_states, target_logits, peagle_segment, target_kv=target_kv
             )
 
         from nemo_automodel.components.speculative.eagle.peagle_data import generate_cod_sample_indices
@@ -194,6 +198,7 @@ class PEagleTrainerModule(nn.Module):
             )
             orig_positions = anchor_pos + depth
             row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
+            target_kv_row = [(k[b : b + 1], v[b : b + 1]) for k, v in target_kv] if target_kv else None
             num, den, correct, valid = self._peagle_position_loss(
                 input_ids[b],
                 aux_hidden_states[b : b + 1],
@@ -204,6 +209,7 @@ class PEagleTrainerModule(nn.Module):
                 row_loss_mask[0, orig_positions].bool(),  # supervision = loss mask at all sampled positions
                 row_length,
                 seq_len,
+                target_kv_row=target_kv_row,
             )
             loss_num = loss_num + num
             loss_den = loss_den + den
@@ -225,6 +231,7 @@ class PEagleTrainerModule(nn.Module):
         loss_positions: torch.Tensor,  # [n] bool -- positions to charge loss/accuracy on
         row_length: torch.Tensor,  # [1] valid document length
         seq_len: int,
+        target_kv_row: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Draft forward + count-normalized KL for one row's COD elements.
 
@@ -258,11 +265,25 @@ class PEagleTrainerModule(nn.Module):
         block_mask = draft.build_peagle_block_mask(
             anchor_pos=anchor_pos, depth=depth, lengths=row_length, total_seq_len=seq_len
         )
+
+        # Build cross-attention mask and pass target KV if available.
+        cross_block_mask = None
+        if target_kv_row is not None:
+            from nemo_automodel.components.speculative.eagle.peagle_cross_attention import build_peagle_cross_block_mask
+
+            cross_block_mask = build_peagle_cross_block_mask(
+                anchor_pos=anchor_pos,
+                depth=depth,
+                target_seq_len=seq_len,
+            )
+
         hidden = draft.forward_peagle(
             sampled_input_ids=flat_ids,
             sampled_projected_hidden=flat_hidden,
             position_ids=orig_positions.unsqueeze(0),
             block_mask=block_mask,
+            target_kv_list=target_kv_row,
+            cross_block_mask=cross_block_mask,
         )
         logits = draft.compute_logits(hidden)[0]  # [n, draft_vocab]
 
@@ -337,6 +358,7 @@ class PEagleTrainerModule(nn.Module):
         aux_hidden_states: torch.Tensor,
         target_logits: torch.Tensor,
         peagle_segment: tuple,
+        target_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> Eagle3StepMetrics:
         """Loss for one segment of a :meth:`build_peagle_plan` plan.
 
@@ -351,6 +373,7 @@ class PEagleTrainerModule(nn.Module):
         b, anchor_pos, depth, orig_positions, loss_positions = plan.units[index]
         seq_len = input_ids.shape[1]
         row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
+        target_kv_row = [(k[b : b + 1], v[b : b + 1]) for k, v in target_kv] if target_kv else None
         num, _den, correct, valid = self._peagle_position_loss(
             input_ids[b],
             aux_hidden_states[b : b + 1],
@@ -361,6 +384,7 @@ class PEagleTrainerModule(nn.Module):
             loss_positions,
             row_length,
             seq_len,
+            target_kv_row=target_kv_row,
         )
         loss = (num / plan.total_den).to(self.draft_model.masked_projected_hidden().dtype)
         accuracy = correct / valid.clamp_min(1.0)

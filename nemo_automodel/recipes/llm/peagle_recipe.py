@@ -81,6 +81,16 @@ class PeagleRecipeMixin:
         draft_config["num_hidden_layers"] = draft_num_hidden_layers
         if "layer_types" in draft_config:
             draft_config["layer_types"] = draft_config["layer_types"][:draft_num_hidden_layers]
+        # KV reuse: enable gated cross-attention to target KV cache at each layer.
+        if recipe_cfg.get("kv_reuse", False):
+            draft_config["kv_reuse"] = True
+            kv_reuse_layer_ids = recipe_cfg.get("kv_reuse_layer_ids", None)
+            if kv_reuse_layer_ids is None:
+                num_target_layers = target_config.num_hidden_layers
+                kv_reuse_layer_ids = [
+                    i * num_target_layers // draft_num_hidden_layers for i in range(draft_num_hidden_layers)
+                ]
+            draft_config["kv_reuse_layer_ids"] = [int(x) for x in kv_reuse_layer_ids]
         return mask_token_id
 
     def build_peagle_trainer(self, recipe_cfg, selected_token_ids, selected_token_mask, mask_token_id):
