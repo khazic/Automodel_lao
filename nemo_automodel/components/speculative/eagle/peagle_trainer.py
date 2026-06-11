@@ -186,6 +186,8 @@ class PEagleTrainerModule(nn.Module):
         loss_den = torch.zeros((), device=input_ids.device, dtype=torch.float32)
         running_correct = torch.zeros((), device=input_ids.device, dtype=torch.float32)
         running_valid = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+        depth_correct_accum: dict[int, int] = {}
+        depth_total_accum: dict[int, int] = {}
 
         for b in range(batch_size):
             row_loss_mask = loss_mask[b : b + 1].long()  # [1, seq_len]
@@ -199,7 +201,7 @@ class PEagleTrainerModule(nn.Module):
             orig_positions = anchor_pos + depth
             row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
             target_kv_row = [(k[b : b + 1], v[b : b + 1]) for k, v in target_kv] if target_kv else None
-            num, den, correct, valid = self._peagle_position_loss(
+            num, den, correct, valid, per_depth_stats = self._peagle_position_loss(
                 input_ids[b],
                 aux_hidden_states[b : b + 1],
                 target_logits[b],
@@ -215,10 +217,23 @@ class PEagleTrainerModule(nn.Module):
             loss_den = loss_den + den
             running_correct = running_correct + correct
             running_valid = running_valid + valid
+            for d, (dc, dt) in per_depth_stats.items():
+                depth_correct_accum[d] = depth_correct_accum.get(d, 0) + dc
+                depth_total_accum[d] = depth_total_accum.get(d, 0) + dt
 
         avg_loss = loss_num / loss_den.clamp_min(1e-5)
         accuracy = running_correct / running_valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=avg_loss.to(ref_dtype), accuracy=accuracy, valid_tokens=running_valid)
+        per_depth_accuracy = {
+            d: depth_correct_accum[d] / depth_total_accum[d]
+            for d in sorted(depth_total_accum)
+            if depth_total_accum[d] > 0
+        }
+        return Eagle3StepMetrics(
+            loss=avg_loss.to(ref_dtype),
+            accuracy=accuracy,
+            valid_tokens=running_valid,
+            per_depth_accuracy=per_depth_accuracy,
+        )
 
     def _peagle_position_loss(
         self,
@@ -299,8 +314,19 @@ class PEagleTrainerModule(nn.Module):
         mask_f = loss_positions.to(elementwise.dtype)
         loss_num = (elementwise * mask_f).sum()
         loss_den = mask_f.sum()
-        correct = ((logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & loss_positions).sum()
-        return loss_num, loss_den, correct.to(loss_num.dtype), loss_den
+        token_correct = (logits.argmax(dim=-1) == draft_target_logits.argmax(dim=-1)) & loss_positions
+        correct = token_correct.sum()
+
+        # Per-depth accuracy: {depth_value: (correct_count, total_count)}
+        per_depth_stats: dict[int, tuple[int, int]] = {}
+        for d in depth.unique().tolist():
+            d_mask = (depth == d) & loss_positions
+            d_total = d_mask.sum().item()
+            if d_total > 0:
+                d_correct = (token_correct & d_mask).sum().item()
+                per_depth_stats[int(d)] = (d_correct, d_total)
+
+        return loss_num, loss_den, correct.to(loss_num.dtype), loss_den, per_depth_stats
 
     @torch.no_grad()
     def build_peagle_plan(self, loss_mask: torch.Tensor) -> "_PeaglePlan":
@@ -374,7 +400,7 @@ class PEagleTrainerModule(nn.Module):
         seq_len = input_ids.shape[1]
         row_length = attention_mask[b].sum().clamp_min(1).reshape(1).to(orig_positions.device)
         target_kv_row = [(k[b : b + 1], v[b : b + 1]) for k, v in target_kv] if target_kv else None
-        num, _den, correct, valid = self._peagle_position_loss(
+        num, _den, correct, valid, per_depth_stats = self._peagle_position_loss(
             input_ids[b],
             aux_hidden_states[b : b + 1],
             target_logits[b],
@@ -388,4 +414,7 @@ class PEagleTrainerModule(nn.Module):
         )
         loss = (num / plan.total_den).to(self.draft_model.masked_projected_hidden().dtype)
         accuracy = correct / valid.clamp_min(1.0)
-        return Eagle3StepMetrics(loss=loss, accuracy=accuracy, valid_tokens=valid)
+        per_depth_accuracy = {d: dc / dt for d, (dc, dt) in per_depth_stats.items() if dt > 0}
+        return Eagle3StepMetrics(
+            loss=loss, accuracy=accuracy, valid_tokens=valid, per_depth_accuracy=per_depth_accuracy
+        )

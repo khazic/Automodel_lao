@@ -1012,6 +1012,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
             running_loss = torch.zeros((), device=self.device)
             running_acc = torch.zeros((), device=self.device)
             running_steps = 0
+            running_per_depth_correct: dict[int, int] = {}
+            running_per_depth_total: dict[int, int] = {}
             self.optimizer.zero_grad(set_to_none=True)
 
             batches_processed = 0
@@ -1047,6 +1049,10 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
 
                 running_loss = running_loss + metrics.loss.detach()
                 running_acc = running_acc + metrics.accuracy.detach()
+                if metrics.per_depth_accuracy is not None:
+                    for d, acc_val in metrics.per_depth_accuracy.items():
+                        running_per_depth_correct[d] = running_per_depth_correct.get(d, 0) + acc_val
+                        running_per_depth_total[d] = running_per_depth_total.get(d, 0) + 1
                 running_steps += 1
                 batches_processed = batch_idx + 1
                 pending_micro_batches += 1
@@ -1065,27 +1071,38 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                         mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
                         current_lr = self.lr_scheduler.get_last_lr()[0]
                         if self.dist_env.is_main:
+                            per_depth_str = ""
+                            wandb_data = {
+                                "train/loss": mean_loss.item(),
+                                "train/accuracy": mean_acc.item(),
+                                "train/lr": current_lr,
+                                "train/grad_norm": float(grad_norm),
+                                "train/epoch": epoch,
+                            }
+                            if running_per_depth_total:
+                                per_depth_acc = {
+                                    d: running_per_depth_correct[d] / running_per_depth_total[d]
+                                    for d in sorted(running_per_depth_total)
+                                }
+                                per_depth_str = " " + " ".join(f"acc_d{d}={v:.4f}" for d, v in per_depth_acc.items())
+                                for d, v in per_depth_acc.items():
+                                    wandb_data[f"train/acc_depth_{d}"] = v
                             logger.info(
-                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e",
+                                "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e grad_norm=%.4f%s",
                                 epoch,
                                 self.runtime.global_step,
                                 mean_loss.item(),
                                 mean_acc.item(),
                                 current_lr,
+                                float(grad_norm),
+                                per_depth_str,
                             )
-                            self._wandb_log(
-                                {
-                                    "train/loss": mean_loss.item(),
-                                    "train/accuracy": mean_acc.item(),
-                                    "train/lr": current_lr,
-                                    "train/grad_norm": float(grad_norm),
-                                    "train/epoch": epoch,
-                                },
-                                step=self.runtime.global_step,
-                            )
+                            self._wandb_log(wandb_data, step=self.runtime.global_step)
                         running_loss.zero_()
                         running_acc.zero_()
                         running_steps = 0
+                        running_per_depth_correct.clear()
+                        running_per_depth_total.clear()
 
             # Flush the trailing partial accumulation window. When
             # ``batches_per_epoch`` is not a multiple of
@@ -1118,27 +1135,38 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     mean_acc = _all_reduce_mean(running_acc / max(running_steps, 1))
                     current_lr = self.lr_scheduler.get_last_lr()[0]
                     if self.dist_env.is_main:
+                        per_depth_str = ""
+                        wandb_data = {
+                            "train/loss": mean_loss.item(),
+                            "train/accuracy": mean_acc.item(),
+                            "train/lr": current_lr,
+                            "train/grad_norm": float(grad_norm),
+                            "train/epoch": epoch,
+                        }
+                        if running_per_depth_total:
+                            per_depth_acc = {
+                                d: running_per_depth_correct[d] / running_per_depth_total[d]
+                                for d in sorted(running_per_depth_total)
+                            }
+                            per_depth_str = " " + " ".join(f"acc_d{d}={v:.4f}" for d, v in per_depth_acc.items())
+                            for d, v in per_depth_acc.items():
+                                wandb_data[f"train/acc_depth_{d}"] = v
                         logger.info(
-                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e (trailing flush)",
+                            "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e grad_norm=%.4f%s (trailing flush)",
                             epoch,
                             self.runtime.global_step,
                             mean_loss.item(),
                             mean_acc.item(),
                             current_lr,
+                            float(grad_norm),
+                            per_depth_str,
                         )
-                        self._wandb_log(
-                            {
-                                "train/loss": mean_loss.item(),
-                                "train/accuracy": mean_acc.item(),
-                                "train/lr": current_lr,
-                                "train/grad_norm": float(grad_norm),
-                                "train/epoch": epoch,
-                            },
-                            step=self.runtime.global_step,
-                        )
+                        self._wandb_log(wandb_data, step=self.runtime.global_step)
                     running_loss.zero_()
                     running_acc.zero_()
                     running_steps = 0
+                    running_per_depth_correct.clear()
+                    running_per_depth_total.clear()
 
             if self.dist_env.is_main:
                 logger.info(

@@ -51,6 +51,7 @@ class Eagle3StepMetrics:
     loss: torch.Tensor
     accuracy: torch.Tensor
     valid_tokens: torch.Tensor
+    per_depth_accuracy: dict[int, float] | None = None
 
 
 class Eagle3TrainerModule(nn.Module):
