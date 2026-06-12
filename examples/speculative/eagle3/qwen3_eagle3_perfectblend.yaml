@@ -13,7 +13,7 @@ recipe_args:
   seq_length: 4096
   micro_batch_size: 1
   grad_accumulation_steps: 1
-  num_workers: 0  # >0 spawns forkserver workers that can't pickle the BOS/EOS-enforced tokenizer class
+  num_workers: 4  # >0 spawns forkserver workers that can't pickle the BOS/EOS-enforced tokenizer class
   num_epochs: 2
   ttt_steps: 7
   draft_vocab_size: 32000
