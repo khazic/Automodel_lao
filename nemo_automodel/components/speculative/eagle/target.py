@@ -39,6 +39,29 @@ def _shift_left_with_zero(tensor: torch.Tensor) -> torch.Tensor:
     return torch.cat((tensor[:, 1:], tail), dim=1)
 
 
+def _layer_key_value(cache, layer_idx: int):
+    """Return the ``(key, value)`` tensors for ``layer_idx`` from a KV cache.
+
+    Works across transformers cache APIs: the >=4.54 / 5.x ``DynamicCache``
+    exposes per-layer ``cache.layers[i].keys / .values`` and is no longer
+    subscriptable, while older versions kept parallel ``key_cache`` /
+    ``value_cache`` lists (and the legacy tuple cache is plain-indexable).
+    """
+    layers = getattr(cache, "layers", None)
+    if layers is not None:
+        layer = layers[layer_idx]
+        keys = getattr(layer, "keys", None)
+        values = getattr(layer, "values", None)
+        if keys is not None and values is not None:
+            return keys, values
+    key_cache = getattr(cache, "key_cache", None)
+    value_cache = getattr(cache, "value_cache", None)
+    if key_cache is not None and value_cache is not None:
+        return key_cache[layer_idx], value_cache[layer_idx]
+    entry = cache[layer_idx]
+    return entry[0], entry[1]
+
+
 @dataclass
 class Eagle3TargetBatch:
     """Target-model supervision for one draft-training batch.
@@ -334,7 +357,9 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                     "kv_reuse is enabled but the target model did not return past_key_values. "
                     "Ensure the target model supports use_cache=True."
                 )
-            target_kv = [(past_kv[lid][0].detach(), past_kv[lid][1].detach()) for lid in self.kv_reuse_layer_ids]
+            target_kv = [
+                tuple(t.detach() for t in _layer_key_value(past_kv, lid)) for lid in self.kv_reuse_layer_ids
+            ]
 
         # HF causal LM outputs wrap logits in a dataclass; AutoModel's
         # custom causal LM returns the logits tensor directly.
