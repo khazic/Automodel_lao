@@ -49,7 +49,7 @@ recipe_args:
   seq_length: 2048
   micro_batch_size: 1
   grad_accumulation_steps: 1
-  num_workers: 8
+  num_workers: 0  # >0 spawns forkserver workers that can't pickle the BOS/EOS-enforced tokenizer class
   num_epochs: 2
   draft_vocab_size: 32000
   selected_token_ids_path: ./outputs/peagle_qwen3_8b_perfectblend/draft_token_map_151936.pt
