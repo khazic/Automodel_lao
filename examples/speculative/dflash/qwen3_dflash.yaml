@@ -41,8 +41,7 @@ recipe_args:
   max_grad_norm: 1.0
 
   # --- checkpoint cadence (independent; the fully-trained model is always saved) ---
-  ckpt_every_steps: 300000           # also save every N optimizer steps
-  # save_checkpoint_every_epoch: false
+  save_checkpoint_every_epoch: true
 
 optimizer:
   lr: 6.0e-4
@@ -57,3 +56,12 @@ checkpoint:
   model_save_format: safetensors
   save_consolidated: true
   # restore_from: LATEST  # "LATEST", a subdir like "epoch_1_step_1000", or an absolute path
+
+wandb:
+  project: automodel
+  name: dflash_qwen3_8b_perfectblend
+  mode: offline
+  dir: ./wandb
+
+ci:
+  nproc_per_node: 8

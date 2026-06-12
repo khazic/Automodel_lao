@@ -23,6 +23,7 @@ recipe_args:
   shuffle_seed: 42
   log_every_steps: 10
   max_grad_norm: 1.0
+  save_checkpoint_every_epoch: true
 
 optimizer:
   lr: 1.0e-4
@@ -34,3 +35,12 @@ checkpoint:
   checkpoint_dir: ./outputs/eagle3_qwen3_8b/checkpoints
   model_save_format: safetensors
   save_consolidated: true
+
+wandb:
+  project: automodel
+  name: eagle3_qwen3_8b_perfectblend
+  mode: offline
+  dir: ./wandb
+
+ci:
+  nproc_per_node: 8
