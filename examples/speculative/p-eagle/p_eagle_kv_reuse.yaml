@@ -48,7 +48,10 @@ recipe_args:
   output_dir: ./outputs/peagle_qwen3_8b_perfectblend
   seq_length: 2048
   micro_batch_size: 1
-  grad_accumulation_steps: 1
+  # 8 amortizes the cross-node TCP gradient all-reduce (~6.4s for the 2B draft
+  # over eth0) across 8 local micro-batches via DDP no_sync; at 1 the all-reduce
+  # dominated each step (7.1s/step, below single-node throughput).
+  grad_accumulation_steps: 8
   num_workers: 0  # >0 spawns forkserver workers that can't pickle the BOS/EOS-enforced tokenizer class
   num_epochs: 2
   draft_vocab_size: 32000
