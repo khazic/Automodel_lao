@@ -50,7 +50,7 @@ recipe_args:
   micro_batch_size: 1
   grad_accumulation_steps: 1
   num_workers: 8
-  num_epochs: 10
+  num_epochs: 2
   draft_vocab_size: 32000
   selected_token_ids_path: ./outputs/peagle_qwen3_8b_perfectblend/draft_token_map_151936.pt
   freeze_embeddings: false
@@ -67,15 +67,17 @@ recipe_args:
   mask_token_id: 151669
   sequence_partitions: 1
 
+  kv_reuse: true
+  # kv_reuse_layer_ids auto-derived from num_draft_layers when omitted.
+
+  ckpt_every_steps: 10000
+  save_checkpoint_every_epoch: true
+
 optimizer:
   lr: 1e-4
   betas: [0.9, 0.95]
   weight_decay: 0
   warmup_ratio: 0.015
-
-recipe_args:
-  ckpt_every_steps: 500000
-  save_checkpoint_every_epoch: true
 
 wandb:
   wandb_project: automodel

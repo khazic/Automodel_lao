@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 
 from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
-from nemo_automodel.components.models.llama.rope_utils import apply_rotary_pos_emb
 from nemo_automodel.components.speculative.eagle.backend import Eagle3TargetBackend
 
 
@@ -160,7 +159,9 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                 raise ValueError(f"aux layer id {layer_id} is out of bounds for model with {num_layers} layers")
         return aux_layer_ids
 
-    def _validate_kv_reuse_layer_ids(self, kv_reuse_layer_ids: Sequence[int] | None) -> list[int] | None:
+    def _validate_kv_reuse_layer_ids(
+        self, kv_reuse_layer_ids: Sequence[int] | None, num_draft_layers: int | None = None
+    ) -> list[int] | None:
         """Validate and default KV reuse layer selection."""
         if kv_reuse_layer_ids is None:
             return None
@@ -169,7 +170,17 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         for layer_id in kv_reuse_layer_ids:
             if layer_id < 0 or layer_id >= num_layers:
                 raise ValueError(f"kv_reuse layer id {layer_id} is out of bounds for model with {num_layers} layers")
+        if num_draft_layers is not None and len(kv_reuse_layer_ids) != num_draft_layers:
+            raise ValueError(
+                f"kv_reuse_layer_ids has {len(kv_reuse_layer_ids)} entries but draft model has "
+                f"{num_draft_layers} layers. They must match 1:1 (draft layer i uses target KV from "
+                f"kv_reuse_layer_ids[i])."
+            )
         return kv_reuse_layer_ids
+
+    def set_kv_reuse_layer_ids(self, kv_reuse_layer_ids: Sequence[int], num_draft_layers: int | None = None) -> None:
+        """Set KV reuse layer IDs after construction (e.g. when derived from draft config)."""
+        self.kv_reuse_layer_ids = self._validate_kv_reuse_layer_ids(kv_reuse_layer_ids, num_draft_layers)
 
     def _get_transformer_layers(self) -> list[nn.Module]:
         """Return decoder layers as an ordered list indexable by integer.
@@ -207,37 +218,6 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         raise ValueError(
             f"Cannot find attention submodule on {type(layer).__name__}; expected attribute 'self_attn' or 'attention'."
         )
-
-    @staticmethod
-    def _make_kv_hook(
-        layer_id: int,
-        attn_module: nn.Module,
-        captured_kv: dict[int, tuple[torch.Tensor, torch.Tensor]],
-    ):
-        """Create a forward hook that captures post-RoPE K and V from a target attention layer.
-
-        The hook fires after the attention forward completes and re-derives K/V
-        from the attention module's input hidden states (args[0]). This avoids
-        depending on internal local variable names across HF transformers versions.
-        The K tensor has RoPE applied; V does not (matching standard practice).
-        """
-        k_proj = attn_module.k_proj
-        v_proj = attn_module.v_proj
-        num_kv_heads = attn_module.num_key_value_heads
-        head_dim = attn_module.head_dim
-
-        def _hook(_module, args, kwargs, _output):
-            hidden_states = args[0]
-            batch_size, seq_len, _ = hidden_states.shape
-            k = k_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-            v = v_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim).transpose(1, 2)
-            position_embeddings = kwargs.get("position_embeddings", None)
-            if position_embeddings is not None:
-                cos, sin = position_embeddings
-                _, k = apply_rotary_pos_emb(k, k, cos, sin)
-            captured_kv[layer_id] = (k.detach(), v.detach())
-
-        return _hook
 
     def get_input_embeddings(self) -> nn.Embedding:
         """Return the target model input embeddings."""
@@ -281,8 +261,15 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         # them and are dropped to keep the call site honest.
         forward_params = inspect.signature(self.model.forward).parameters
         extra_kwargs = {
-            name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
+            name: False for name in ("output_hidden_states", "output_attentions") if name in forward_params
         }
+        # When KV reuse is active, enable the cache so we can extract the real
+        # post-RoPE/post-norm K and V directly from the model's own cache object.
+        # This is correct for all architectures (Llama, Qwen3 with k_norm, etc.)
+        # because the cache receives KV after the full attention projection pipeline.
+        use_cache_for_kv = bool(self.kv_reuse_layer_ids) and "use_cache" in forward_params
+        if "use_cache" in forward_params:
+            extra_kwargs["use_cache"] = use_cache_for_kv
 
         # Packing isolates documents per attention backend; the mask strategy
         # differs because FlashAttention has no 4D-mask code path:
@@ -322,19 +309,6 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
                     device=input_ids.device,
                 )
 
-        # KV reuse hooks: capture post-projection K/V from target attention layers.
-        captured_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        if self.kv_reuse_layer_ids:
-            kv_layers = self._get_transformer_layers()
-            for kv_layer_id in self.kv_reuse_layer_ids:
-                attn_module = self._get_attention_module(kv_layers[kv_layer_id])
-                handles.append(
-                    attn_module.register_forward_hook(
-                        self._make_kv_hook(kv_layer_id, attn_module, captured_kv),
-                        with_kwargs=True,
-                    )
-                )
-
         try:
             outputs = self.model(
                 input_ids=input_ids,
@@ -353,13 +327,14 @@ class HFEagle3TargetModel(Eagle3TargetBackend):
         aux_hidden_states = torch.cat([captured[layer_id] for layer_id in self.aux_layer_ids], dim=-1)
 
         target_kv = None
-        if self.kv_reuse_layer_ids:
-            if len(captured_kv) != len(self.kv_reuse_layer_ids):
+        if self.kv_reuse_layer_ids and use_cache_for_kv:
+            past_kv = outputs.past_key_values if hasattr(outputs, "past_key_values") else None
+            if past_kv is None:
                 raise RuntimeError(
-                    f"Expected {len(self.kv_reuse_layer_ids)} captured KV layers but got "
-                    f"{len(captured_kv)}: {sorted(captured_kv)}"
+                    "kv_reuse is enabled but the target model did not return past_key_values. "
+                    "Ensure the target model supports use_cache=True."
                 )
-            target_kv = [captured_kv[lid] for lid in self.kv_reuse_layer_ids]
+            target_kv = [(past_kv[lid][0].detach(), past_kv[lid][1].detach()) for lid in self.kv_reuse_layer_ids]
 
         # HF causal LM outputs wrap logits in a dataclass; AutoModel's
         # custom causal LM returns the logits tensor directly.

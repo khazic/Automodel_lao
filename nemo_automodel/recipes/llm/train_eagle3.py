@@ -210,6 +210,13 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         mask_token_id = None
         if parallel_drafting:
             mask_token_id = self._configure_peagle_draft_config(recipe_cfg, draft_config, target_config)
+            # Propagate derived kv_reuse_layer_ids to the target wrapper. The recipe
+            # derives these in _configure_peagle_draft_config (which runs after the target
+            # is constructed), so the target cannot read them from recipe_cfg at init time.
+            if draft_config.get("kv_reuse", False) and self.target_wrapper is not None:
+                kv_layer_ids = draft_config["kv_reuse_layer_ids"]
+                num_draft_layers = draft_config["num_hidden_layers"]
+                self.target_wrapper.set_kv_reuse_layer_ids(kv_layer_ids, num_draft_layers=num_draft_layers)
         # Cast to the target's compute dtype so every linear / embedding / norm
         # in the draft matches the bf16 (cuda) or fp32 (cpu) hidden states fed
         # in from the target. Without this, ``initialize_rms_norm_module`` defaults
