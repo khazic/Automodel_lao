@@ -49,6 +49,7 @@ from nemo_automodel.components.config._arg_parser import parse_args_and_load_con
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.loggers.log_utils import setup_logging
+from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppress_wandb_log_messages
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
@@ -74,6 +75,14 @@ def _all_reduce_mean(value: torch.Tensor) -> torch.Tensor:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         value = value / dist.get_world_size()
     return value
+
+
+def _best_effort(label: str, fn) -> None:
+    """Run a teardown step, logging (never raising) on failure."""
+    try:
+        fn()
+    except Exception:
+        logger.exception("error %s during cleanup", label)
 
 
 def _all_ranks_have_valid(local_has_valid: int, is_ddp: bool, device) -> bool:
@@ -263,6 +272,16 @@ class TrainDFlashRecipe(BaseRecipe):
         self.rng = StatefulRNG(seed=int(recipe_cfg.get("shuffle_seed", 42)), ranked=self.dist_env.world_size > 1)
         self._build_checkpointer(target_path)
         self.load_checkpoint(self.cfg.get("checkpoint.restore_from", None))
+
+        # Optional Weights & Biases logging (rank 0 only).
+        self.wandb_run = None
+        if self.dist_env.is_main and self.cfg.get("wandb", None) is not None:
+            suppress_wandb_log_messages()
+            self.wandb_run = init_wandb_run(
+                self.cfg.wandb.to_dict(),
+                self.cfg.to_dict(),
+                default_name="dflash_" + str(target_path).rstrip("/").split("/")[-1],
+            )
 
     @staticmethod
     def _resolve_mask_token_id(recipe_cfg, vocab_size: int) -> int:
@@ -552,6 +571,12 @@ class TrainDFlashRecipe(BaseRecipe):
             "val_accuracy": (total_acc / total_batches.clamp_min(1)).item(),
         }
 
+    def _wandb_log(self, data: dict, step: int) -> None:
+        """Log a metrics dict to W&B when a run is active (rank 0)."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            run.log(data, step=step)
+
     def run_train_validation_loop(self):
         """Run the DFlash training loop."""
         self.trainer_module.train()
@@ -559,6 +584,8 @@ class TrainDFlashRecipe(BaseRecipe):
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
+            if getattr(self, "wandb_run", None) is not None:
+                _best_effort("finishing W&B run", self.wandb_run.finish)
             return
 
         pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
@@ -658,6 +685,15 @@ class TrainDFlashRecipe(BaseRecipe):
                                 avg_acc,
                                 current_lr,
                             )
+                            self._wandb_log(
+                                {
+                                    "train/loss": avg_loss,
+                                    "train/acc": avg_acc,
+                                    "train/lr": current_lr,
+                                    "train/epoch": epoch_idx + 1,
+                                },
+                                step=self.runtime.global_step,
+                            )
                             running_loss = 0.0
                             running_acc = 0.0
                             running_micro = 0
@@ -691,6 +727,19 @@ class TrainDFlashRecipe(BaseRecipe):
                             f" val_loss={eval_metrics['val_loss']:.4f} val_accuracy={eval_metrics['val_accuracy']:.4f}"
                         )
                     logger.info(msg)
+                    log_data = {
+                        "train/epoch": epoch_idx + 1,
+                        "train/completed_steps_in_epoch": completed_steps,
+                        "train/skipped_short_micro_batches": self._skipped_micro_batches,
+                    }
+                    if eval_metrics is not None:
+                        log_data.update(
+                            {
+                                "val/loss": eval_metrics["val_loss"],
+                                "val/accuracy": eval_metrics["val_accuracy"],
+                            }
+                        )
+                    self._wandb_log(log_data, step=self.runtime.global_step)
 
                 if getattr(self, "save_checkpoint_every_epoch", False) and last_batch_idx >= 0:
                     avg_loss = epoch_loss / max(1, micro_step) if micro_step else None
@@ -709,6 +758,8 @@ class TrainDFlashRecipe(BaseRecipe):
         finally:
             if pbar is not None:
                 pbar.close()
+            if getattr(self, "wandb_run", None) is not None:
+                _best_effort("finishing W&B run", self.wandb_run.finish)
 
 
 def main(config_path: str | None = None):

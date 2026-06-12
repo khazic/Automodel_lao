@@ -41,6 +41,3 @@ wandb:
   name: eagle3_qwen3_8b_perfectblend
   mode: offline
   dir: ./wandb
-
-ci:
-  nproc_per_node: 8
