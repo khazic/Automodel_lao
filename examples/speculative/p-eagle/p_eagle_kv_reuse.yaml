@@ -80,7 +80,7 @@ optimizer:
   warmup_ratio: 0.015
 
 wandb:
-  wandb_project: automodel
-  wandb_name: p_eagle_kv_reuse
+  project: automodel
+  name: p_eagle_kv_reuse
   mode: offline
-  wandb_dir: ./wandb
+  dir: ./wandb
