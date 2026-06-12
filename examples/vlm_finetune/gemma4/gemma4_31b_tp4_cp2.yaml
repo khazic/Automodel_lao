@@ -55,7 +55,9 @@ checkpoint:
   enabled: true
   checkpoint_dir: vlm_checkpoints/gemma4_31b_it_tp4_cp2/
   model_save_format: torch_save
-  save_consolidated: false
+  # final: export one HF-loadable consolidated safetensors dir at the end of
+  # training (per-step checkpoints stay as DCP shards; no per-save stall).
+  save_consolidated: final
 
 distributed:
   strategy: fsdp2
