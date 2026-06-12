@@ -33,8 +33,8 @@ optimizer:
 checkpoint:
   enabled: true
   checkpoint_dir: ./outputs/eagle3_qwen3_8b/checkpoints
-  model_save_format: safetensors
-  save_consolidated: true
+  model_save_format: torch_save
+  save_consolidated: false
 
 wandb:
   project: automodel
