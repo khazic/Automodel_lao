@@ -974,13 +974,16 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.min_lr_ratio,
             )
 
+        pbar = self._make_progress_bar(total=self.total_optim_steps, initial=self.runtime.global_step)
         try:
-            self._train_epochs(start_epoch, batches_per_epoch, is_ddp)
+            self._train_epochs(start_epoch, batches_per_epoch, is_ddp, pbar)
             self._maybe_save_final_checkpoint(self.num_epochs)
             self._finalize_pending_checkpoint()
             if self.dist_env.is_main:
                 logger.info("Training complete: global_step=%s", self.runtime.global_step)
         finally:
+            if pbar is not None:
+                pbar.close()
             self._finalize_training()
 
     def _finalize_training(self) -> None:
@@ -1002,7 +1005,7 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
         if getattr(self, "wandb_run", None) is not None:
             _best_effort("finishing W&B run", self.wandb_run.finish)
 
-    def _train_epochs(self, start_epoch, batches_per_epoch, is_ddp):
+    def _train_epochs(self, start_epoch, batches_per_epoch, is_ddp, pbar=None):
         """Run the epoch loop (extracted so :meth:`run_train_validation_loop` can
         wrap it in ``try/finally`` and guarantee teardown on any exit path)."""
         for epoch in range(start_epoch, self.num_epochs):
@@ -1063,6 +1066,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.runtime.global_step += 1
+                    if pbar is not None:
+                        pbar.update(1)
                     pending_micro_batches = 0
                     self._maybe_save_step_checkpoint(epoch)
 
@@ -1087,6 +1092,12 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                                 per_depth_str = " " + " ".join(f"acc_d{d}={v:.4f}" for d, v in per_depth_acc.items())
                                 for d, v in per_depth_acc.items():
                                     wandb_data[f"train/acc_depth_{d}"] = v
+                            if pbar is not None:
+                                pbar.set_postfix(
+                                    loss=f"{mean_loss.item():.4f}",
+                                    acc=f"{mean_acc.item():.4f}",
+                                    lr=f"{current_lr:.2e}",
+                                )
                             logger.info(
                                 "epoch=%s step=%s train_loss=%.6f train_acc=%.6f lr=%.3e grad_norm=%.4f%s",
                                 epoch,
@@ -1127,6 +1138,8 @@ class TrainEagle3Recipe(PeagleRecipeMixin, BaseRecipe):
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.runtime.global_step += 1
+                if pbar is not None:
+                    pbar.update(1)
                 pending_micro_batches = 0
                 self._maybe_save_step_checkpoint(epoch)
 
