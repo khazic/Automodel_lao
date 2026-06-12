@@ -46,9 +46,14 @@ logger = logging.getLogger(__name__)
 # ``flex_attention`` for unsupported cases -- correct, just slower -- which keeps
 # P-EAGLE unit tests and small CPU/GPU smoke checks runnable. The compiled
 # callable is lazy, so importing this module on CPU costs nothing.
+# ``dynamic=True``: COD subsampling gives every rank a different flat sequence
+# length, so a static-by-default first compile never matches the shared Inductor
+# cache and each fresh process pays a full max-autotune pass. Compiling dynamic
+# from the start lets every rank reuse the one cached dynamic kernel.
 _peagle_flex_attention_compiled = torch.compile(
     flex_attention,
     mode="max-autotune-no-cudagraphs",
+    dynamic=True,
 )
 _peagle_flex_attention_compile_failed = False
 
