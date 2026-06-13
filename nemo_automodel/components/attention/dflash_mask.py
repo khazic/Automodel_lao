@@ -43,8 +43,8 @@ from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 # overhead of evaluating mask_mod across the BlockMask grid.
 # ``dynamic=True``: the mask shape depends on the per-batch anchor count
 # (``min(num_anchors, valid anchors in the batch)``), so a static compile
-# re-specializes (a full recompile, seconds of stall) every time a batch with
-# a new anchor count appears. One dynamic compile covers every shape.
+# re-specializes (a full recompile, a multi-second stall mid-training) every
+# time a batch carries a new anchor count. One dynamic compile covers all.
 _compiled_create_block_mask = None
 
 
