@@ -138,9 +138,9 @@ def create_peagle_cross_attn_mask_mod(
 ):
     """Build a flex_attention mask_mod for cross-attention to target KV.
 
-    Each draft query at reference position (anchor_pos + depth) can attend
-    to target KV at positions <= that reference position. This simulates
-    inference where the target KV cache only covers the verified prefix.
+    All draft depths can only attend to target KV at positions <= anchor_pos.
+    This matches inference where the target KV cache only contains tokens up
+    to the last verified position (the anchor), regardless of draft depth.
 
     Args:
         draft_anchor_pos: [total_sampled] anchor positions per COD element.
@@ -152,7 +152,7 @@ def create_peagle_cross_attn_mask_mod(
     """
 
     def cross_mask_mod(_b, _h, q_idx, kv_idx):
-        q_ref_pos = draft_anchor_pos[q_idx] + draft_depth[q_idx]
+        q_ref_pos = draft_anchor_pos[q_idx]
         return kv_idx <= q_ref_pos
 
     return cross_mask_mod

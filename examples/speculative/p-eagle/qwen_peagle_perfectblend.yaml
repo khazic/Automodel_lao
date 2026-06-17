@@ -25,7 +25,7 @@ dist_env:
   timeout_minutes: 30
 
 recipe_args:
-  target_model_name_or_path: Qwen/Qwen3-8B
+  target_model_name_or_path: /llm-align/open_models/Qwen3/Qwen3-8B
 
   # ``jihwan1205/perfectblend-qwen3-8b-regen`` is
   # distributed with a ``conversations`` column, but ChatDataset expects
@@ -39,19 +39,19 @@ recipe_args:
   # [pd.read_parquet(hf_hub_download(repo_id=repo, repo_type='dataset', filename=f)).rename(columns={'conversations':'messages'}).to_parquet(dst / Path(f).name, index=False) for f in files]; \
   # print(f'wrote {len(files)} shards to {dst}')"
 
-  train_data_path: ./cache/dataset/perfectblend-qwen3-8b-regen-messages
+  train_data_path: /llm-align/liuchonghan/Automodel_lao/cache/dataset/perfectblend-qwen3-8b-regen-messages
   val_data_path: null
 
   train_split: "train[:70000]"
   val_split: null
 
   output_dir: ./outputs/peagle_qwen3_8b_perfectblend
-  seq_length: 4096
+  seq_length: 2048
   micro_batch_size: 1
-  grad_accumulation_steps: 1
-  num_workers: 8
-  num_epochs: 20
-  draft_vocab_size: 151936
+  grad_accumulation_steps: 8
+  num_workers: 0
+  num_epochs: 2
+  draft_vocab_size: 32000
   selected_token_ids_path: ./outputs/peagle_qwen3_8b_perfectblend/draft_token_map_151936.pt
   freeze_embeddings: false
   trust_remote_code: false
@@ -104,9 +104,17 @@ recipe_args:
   # train on long contexts that would otherwise OOM. Leave at 1 until you hit a
   # memory wall, then raise it (e.g. 2/4/8).
   sequence_partitions: 1
+  ckpt_every_steps: 10000
+  save_checkpoint_every_epoch: true
 
 optimizer:
   lr: 1e-4
   betas: [0.9, 0.95]
   weight_decay: 0
   warmup_ratio: 0.015
+
+wandb:
+  project: automodel
+  name: p_eagle
+  mode: offline
+  dir: ./wandb

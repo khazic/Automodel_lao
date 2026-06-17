@@ -45,7 +45,7 @@ recipe_args:
   train_split: "train"
   val_split: null
 
-  output_dir: ./outputs/peagle_qwen3_8b_perfectblend
+  output_dir: ./outputs/p_eagle_kv_reuse
   seq_length: 2048
   micro_batch_size: 1
   # 8 amortizes the cross-node TCP gradient all-reduce (~6.4s for the 2B draft
