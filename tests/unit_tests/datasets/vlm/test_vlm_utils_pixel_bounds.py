@@ -48,3 +48,15 @@ def test_flat_attribute_is_set_even_without_a_size_dict():
     processor = SimpleNamespace(image_processor=SimpleNamespace(max_pixels=99, min_pixels=1, size=None))
     set_image_pixel_bounds(processor, max_pixels=802816)
     assert processor.image_processor.max_pixels == 802816
+
+
+def test_caps_transformers_5_size_dict_edges():
+    size = SimpleNamespace(longest_edge=12845056, shortest_edge=3136)
+    processor = SimpleNamespace(image_processor=SimpleNamespace(max_pixels=None, min_pixels=None, size=size))
+
+    set_image_pixel_bounds(processor, max_pixels=802816, min_pixels=6272)
+
+    assert processor.image_processor.max_pixels == 802816
+    assert processor.image_processor.min_pixels == 6272
+    assert size.longest_edge == 802816
+    assert size.shortest_edge == 6272

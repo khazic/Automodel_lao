@@ -50,10 +50,16 @@ from nemo_automodel.components.speculative.bench_sweep import (
 def test_dataset_spec_requires_exactly_one_column():
     DatasetSpec(name="a", input_data="d", messages_column="messages")  # ok
     DatasetSpec(name="a", input_data="d", prompt_column="text")  # ok
+    DatasetSpec(name="a", input_data="d", benchmark_adapter="textvqa")  # ok
     with pytest.raises(ValueError, match="exactly one"):
         DatasetSpec(name="a", input_data="d")  # neither
     with pytest.raises(ValueError, match="exactly one"):
         DatasetSpec(name="a", input_data="d", messages_column="messages", prompt_column="text")  # both
+
+
+def test_dataset_spec_rejects_unknown_benchmark_adapter():
+    with pytest.raises(ValueError, match="unsupported benchmark_adapter"):
+        DatasetSpec(name="a", input_data="d", benchmark_adapter="unknown")
 
 
 def test_default_dataset_presets_are_the_eagle_paper_suite():
@@ -125,6 +131,16 @@ def test_shipped_example_config_loads(monkeypatch):
     assert [s.name for s in specs] == ["mt_bench", "humaneval", "gsm8k", "alpaca"]
 
 
+def test_shipped_vlm_example_config_loads():
+    import pathlib
+
+    repo_root = pathlib.Path(bench_sweep.__file__).resolve().parents[3]
+    example = repo_root / "examples" / "speculative" / "bench_sweep" / "vlm_spec_bench_datasets.yaml"
+    specs = _load_dataset_specs(str(example))
+    assert [s.name for s in specs] == ["gqa", "textvqa", "coco_caption", "charxiv_reasoning", "mmmu_pro"]
+    assert all(spec.benchmark_adapter for spec in specs)
+
+
 # ---------------------------------------------------------------------------
 # _select_datasets
 # ---------------------------------------------------------------------------
@@ -173,6 +189,7 @@ def test_dataset_args_overrides_only_dataset_fields():
     assert args.dataset_name == "main"
     assert args.prompt_column == "q"
     assert args.messages_column is None
+    assert args.benchmark_adapter is None
     # Unrelated fields pass through unchanged.
     assert args.server == "http://x"
     assert args.num_prompts == 64

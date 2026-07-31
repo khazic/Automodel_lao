@@ -34,9 +34,9 @@ fresh single-turn user message; a list value, e.g. MT-Bench's two-turn
 
 Override the default suite with ``--datasets-config <path.yaml>``: a YAML list
 of entries, each ``{name, input_data, split, dataset_name, messages_column |
-prompt_column, max_new_tokens}`` (``dataset_name``/``max_new_tokens`` optional;
-exactly one of ``messages_column``/``prompt_column`` required). ``--datasets``
-further narrows either suite to a name subset.
+prompt_column | benchmark_adapter, max_new_tokens}``. ``dataset_name`` and
+``max_new_tokens`` are optional; exactly one prompt source is required.
+``--datasets`` further narrows either suite to a name subset.
 
 Typical usage (after ``serve_sglang`` launches the drafter on port 30000)::
 
@@ -82,7 +82,8 @@ class DatasetSpec:
 
     Exactly one of ``messages_column`` (an existing OpenAI-messages list) or
     ``prompt_column`` (a raw text field, wrapped into a single-turn user
-    message) must be set -- see ``bench_common._load_prompts``.
+    message) must be set for text datasets. A multimodal ``benchmark_adapter``
+    instead owns the benchmark's prompt and image schema.
 
     ``prompt_context_column`` is an optional second raw-text field appended to
     ``prompt_column`` (separated by a blank line) when it is non-empty, for
@@ -97,14 +98,24 @@ class DatasetSpec:
     messages_column: str | None = None
     prompt_column: str | None = None
     prompt_context_column: str | None = None
+    benchmark_adapter: str | None = None
     max_new_tokens: int | None = None
 
     def __post_init__(self):
-        if bool(self.messages_column) == bool(self.prompt_column):
+        num_sources = sum(bool(value) for value in (self.messages_column, self.prompt_column, self.benchmark_adapter))
+        if num_sources != 1:
             raise ValueError(
-                f"dataset {self.name!r}: exactly one of messages_column / prompt_column must be set "
-                f"(got messages_column={self.messages_column!r}, prompt_column={self.prompt_column!r})"
+                f"dataset {self.name!r}: exactly one of messages_column / prompt_column / benchmark_adapter must be set"
             )
+        if self.benchmark_adapter:
+            from nemo_automodel.components.speculative.bench_multimodal import MultimodalBenchmark
+
+            try:
+                MultimodalBenchmark(self.benchmark_adapter)
+            except ValueError as exc:
+                raise ValueError(
+                    f"dataset {self.name!r}: unsupported benchmark_adapter={self.benchmark_adapter!r}"
+                ) from exc
         if self.prompt_context_column and not self.prompt_column:
             raise ValueError(
                 f"dataset {self.name!r}: prompt_context_column={self.prompt_context_column!r} requires "
@@ -199,6 +210,7 @@ def _dataset_args(base_args: argparse.Namespace, spec: DatasetSpec) -> argparse.
     args.messages_column = spec.messages_column
     args.prompt_column = spec.prompt_column
     args.prompt_context_column = spec.prompt_context_column
+    args.benchmark_adapter = spec.benchmark_adapter
     if spec.max_new_tokens is not None:
         args.max_new_tokens = spec.max_new_tokens
     return args

@@ -361,10 +361,23 @@ def set_image_pixel_bounds(processor, *, max_pixels: int | None = None, min_pixe
     for attribute, value in (("max_pixels", max_pixels), ("min_pixels", min_pixels)):
         if value is None:
             continue
-        setattr(image_processor, attribute, int(value))
+        bound = int(value)
+        setattr(image_processor, attribute, bound)
         # transformers >= 5 reads the bounds off ``size`` when it is present,
         # falling back to the flat attributes only when it is not.
         size = getattr(image_processor, "size", None)
-        if isinstance(size, dict) and attribute in size:
-            size[attribute] = int(value)
-        logger.info("Capped processor %s at %d", attribute, int(value))
+        if size is not None:
+            size_attribute = {"max_pixels": "longest_edge", "min_pixels": "shortest_edge"}[attribute]
+            if isinstance(size, dict):
+                if attribute in size:
+                    size[attribute] = bound
+                if size_attribute in size:
+                    size[size_attribute] = bound
+            elif hasattr(size, size_attribute):
+                # Transformers 5 normalizes image-processor ``size`` into a
+                # SizeDict rather than a built-in dict. Qwen2.5-VL reads
+                # longest_edge/shortest_edge from that object at preprocessing
+                # time, so updating only the legacy flat max_pixels/min_pixels
+                # attributes leaves the default 12.8M-pixel ceiling active.
+                setattr(size, size_attribute, bound)
+        logger.info("Capped processor %s at %d", attribute, bound)

@@ -14,9 +14,12 @@
 
 """Unit tests for the ViSpec draft model, training objective, and target wrapper."""
 
+import json
+
 import pytest
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file, save_file
 from transformers import LlamaConfig
 
 from nemo_automodel.components.loss.listmle import listmle_loss
@@ -39,6 +42,7 @@ from nemo_automodel.components.speculative.eagle.vispec_target import (
     HFVispecTargetModel,
     _shift_left_with_zero,
 )
+from tools.convert_vispec_checkpoint import convert
 
 HIDDEN = 32
 VOCAB = 64
@@ -60,7 +64,9 @@ def _draft_config(num_query_tokens: int = 2) -> LlamaConfig:
 
 def _draft(num_query_tokens: int = 2) -> VispecDraftModel:
     torch.manual_seed(0)
-    return VispecDraftModel(_draft_config(num_query_tokens))
+    config = _draft_config(num_query_tokens)
+    apply_vispec_draft_architecture(config)
+    return VispecDraftModel(config)
 
 
 def _batch(seq_len: int = 12, image_span: tuple[int, int] = (2, 7)):
@@ -93,10 +99,78 @@ class TestImageAdaptor:
 
 
 class TestDraftModel:
+    def test_cached_attention_matches_full_causal_attention(self):
+        """Chunked draft inference must preserve full-sequence FP32 attention."""
+        from nemo_automodel.components.speculative.eagle.draft_llama_v12 import _build_causal_mask
+
+        attention = _draft().layers[0].self_attn.eval()
+        torch.manual_seed(7)
+        hidden_states = torch.randn(1, 6, HIDDEN)
+        position_ids = torch.arange(6).unsqueeze(0)
+        full_mask = _build_causal_mask(torch.ones(1, 6), hidden_states.dtype)
+
+        with torch.no_grad():
+            full_output = attention(hidden_states, full_mask, position_ids)
+            _, prefix_cache = attention._forward_cached(
+                hidden_states[:, :4],
+                full_mask[:, :, :4, :4],
+                position_ids[:, :4],
+                None,
+            )
+            cached_output, cache = attention._forward_cached(
+                hidden_states[:, 4:],
+                full_mask[:, :, 4:, :],
+                position_ids[:, 4:],
+                prefix_cache,
+            )
+
+        torch.testing.assert_close(cached_output, full_output[:, 4:], rtol=1e-5, atol=1e-5)
+        assert cache[0].shape == (1, 4, 6, HIDDEN // 4)
+        assert cache[1].shape == (1, 4, 6, HIDDEN // 4)
+
     def test_output_keeps_original_sequence_layout(self):
         draft = _draft()
         out = draft(*_batch())
         assert out.shape == (1, 12, HIDDEN)
+
+    def test_cached_prefill_matches_full_draft_last_hidden(self):
+        """Cached image compression preserves the regular draft forward output."""
+        draft = _draft().eval()
+        batch = _batch()
+        with torch.no_grad():
+            full_output = draft(*batch)
+            cached_last, cache, global_image_feature = draft._prefill_generation(*batch)
+
+        torch.testing.assert_close(cached_last, full_output[:, -1])
+        assert cache[0][0].shape[-2] < batch[0].shape[1]
+        assert global_image_feature.shape == (1, HIDDEN)
+
+    def test_cached_text_decode_matches_full_draft_suffix(self):
+        """Incremental text decoding preserves the regular causal draft output."""
+        draft = _draft().eval()
+        inputs_embeds, hidden_states, attention_mask, _ = _batch(seq_len=8)
+        image_mask = torch.zeros(1, 8, dtype=torch.bool)
+        with torch.no_grad():
+            full_output = draft(inputs_embeds, hidden_states, attention_mask, image_mask)
+            _, cache, global_image_feature = draft._prefill_generation(
+                inputs_embeds[:, :5],
+                hidden_states[:, :5],
+                attention_mask[:, :5],
+                image_mask[:, :5],
+            )
+            allowed = torch.ones(3, 8, dtype=torch.bool)
+            allowed[:, 5:] = torch.tril(torch.ones(3, 3, dtype=torch.bool))
+            decode_mask = torch.zeros(1, 1, 3, 8).masked_fill(~allowed.view(1, 1, 3, 8), torch.finfo(torch.float32).min)
+            cached_suffix, _ = draft._decode_generation(
+                inputs_embeds[:, 5:],
+                hidden_states[:, 5:],
+                global_image_feature,
+                torch.arange(5, 8).unsqueeze(0),
+                decode_mask,
+                cache,
+            )
+
+        torch.testing.assert_close(cached_suffix, full_output[:, 5:], rtol=1e-5, atol=1e-5)
 
     def test_compressed_image_positions_are_zero_filled(self):
         """Only the last (num_query_tokens - 1) positions of a span survive; the
@@ -157,6 +231,7 @@ class TestDraftModel:
     def test_img_fc_starts_as_identity_pass_through(self):
         """Stage 2 must start numerically equal to the stage-1 draft it loads."""
         config = _draft_config()
+        apply_vispec_draft_architecture(config)
         torch.manual_seed(0)
         vispec = VispecDraftModel(config)
         torch.manual_seed(0)
@@ -183,6 +258,7 @@ class TestDraftModel:
 
     def test_stage1_checkpoint_loads_non_strictly(self):
         config = _draft_config()
+        apply_vispec_draft_architecture(config)
         stage1 = LlamaEagleDraftModel(config)
         draft = VispecDraftModel(config)
         missing, unexpected = draft.load_state_dict(stage1.state_dict(), strict=False)
@@ -481,6 +557,12 @@ class TestDraftArchitecture:
         # The adaptor follows the same qkv split.
         assert draft.img_adaptor.k_proj.bias is not None
         assert draft.img_adaptor.o_proj.bias is None
+        # The released draft skips these two normalization operations entirely.
+        assert draft.layers[0].input_layernorm is None
+        assert draft.layers[0].self_attn.use_sdpa_attention is True
+        assert isinstance(draft.norm, nn.Identity)
+        assert "layers.0.input_layernorm.weight" not in draft.state_dict()
+        assert "norm.weight" not in draft.state_dict()
 
     def test_img_fc_still_starts_as_identity(self):
         """The added bias must be zeroed, or stage 2 no longer starts at stage 1."""
@@ -490,11 +572,14 @@ class TestDraftArchitecture:
         assert torch.equal(draft.img_fc.weight[:, HIDDEN:], torch.zeros(HIDDEN, HIDDEN))
 
     def test_unpinned_config_keeps_the_bias_free_draft(self):
-        """EAGLE-1/2 configs set none of the three fields and must be unchanged."""
+        """EAGLE-1/2 configs set no ViSpec fields and must be unchanged."""
         draft = LlamaEagleDraftModel(self._gqa_config())
         assert draft.fc.bias is None
         assert draft.layers[0].self_attn.q_proj.bias is None
         assert draft.layers[0].self_attn.num_key_value_heads == 1
+        assert draft.layers[0].input_layernorm is not None
+        assert draft.layers[0].self_attn.use_sdpa_attention is False
+        assert not isinstance(draft.norm, nn.Identity)
 
     def test_attention_bias_still_biases_o_proj(self):
         """The Llama-style flag keeps its meaning: all four projections."""
@@ -503,6 +588,30 @@ class TestDraftArchitecture:
         attention = LlamaEagleDraftModel(config).layers[0].self_attn
         assert attention.q_proj.bias is not None
         assert attention.o_proj.bias is not None
+
+
+def test_checkpoint_converter_preserves_reference_normalization_contract(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"hidden_size": HIDDEN, "num_hidden_layers": 1}))
+    save_file(
+        {
+            "imadpt.q": torch.randn(2, HIDDEN),
+            "embed_tokens.weight": torch.randn(VOCAB, HIDDEN),
+        },
+        source / "model.safetensors",
+    )
+
+    convert(source, destination)
+
+    converted_config = json.loads((destination / "config.json").read_text())
+    converted_state = load_file(destination / "model.safetensors")
+    assert converted_config["draft_skip_first_input_norm"] is True
+    assert converted_config["draft_apply_final_norm"] is False
+    assert converted_config["draft_use_sdpa_attention"] is True
+    assert "layers.0.input_layernorm.weight" not in converted_state
+    assert "norm.weight" not in converted_state
 
 
 class TestStageNoiseWiring:

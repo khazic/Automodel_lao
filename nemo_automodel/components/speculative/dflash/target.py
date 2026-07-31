@@ -97,7 +97,9 @@ class HFDFlashTargetModel:
             )
 
     def _validate_layer_ids(self, target_layer_ids: Sequence[int]) -> list[int]:
-        num_layers = self.model.config.num_hidden_layers
+        config = self.model.config
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+        num_layers = text_config.num_hidden_layers
         target_layer_ids = list(target_layer_ids)
         if len(target_layer_ids) == 0:
             raise ValueError("DFlash requires at least one target_layer_id.")
@@ -229,4 +231,113 @@ class HFDFlashTargetModel:
             position_ids=position_ids,
             seq_lens=seq_lens,
             doc_remaining=doc_remaining,
+        )
+
+
+class HFMultimodalDFlashTargetModel(HFDFlashTargetModel):
+    """Capture language-decoder hidden states from a frozen multimodal target.
+
+    The target performs its normal vision encoding and image-token replacement;
+    DFlash then consumes selected language-layer outputs. Image tensors are not
+    passed to the draft itself.
+    """
+
+    def _get_transformer_layers(self) -> list[nn.Module]:
+        """Return the multimodal target's language decoder layers in order."""
+        base_model = getattr(self.model, "model", None)
+        language_model = getattr(base_model, "language_model", None)
+        if language_model is None or not hasattr(language_model, "layers"):
+            raise ValueError("Unsupported multimodal model structure for DFlash hidden-state capture")
+        container = language_model.layers
+        if isinstance(container, nn.ModuleDict):
+            return [container[str(i)] for i in range(len(container))]
+        return list(container)
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        pixel_values_videos: torch.Tensor | None = None,
+        video_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ) -> DFlashTargetBatch:
+        """Run the VLM and capture selected language-layer hidden states.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+            attention_mask: Tensor of shape [batch, sequence].
+            loss_mask: Tensor of shape [batch, sequence], nonzero only at
+                assistant-response positions.
+            pixel_values: Optional tensor of shape [patches, patch_features].
+            image_grid_thw: Optional long tensor of shape [images, 3].
+            pixel_values_videos: Optional video-patch tensor.
+            video_grid_thw: Optional long tensor of shape [videos, 3].
+            mm_token_type_ids: Optional integer tensor of shape [batch,
+                sequence] identifying text and multimodal token positions.
+            position_ids: Optional target-model position tensor. Qwen3-VL
+                normally derives its 3D mRoPE positions internally when this
+                is omitted.
+
+        Returns:
+            A target batch whose ``hidden_states`` tensor has shape [batch,
+            sequence, captured_layers * hidden].
+        """
+        if self._cp_size > 1:
+            raise NotImplementedError("Multimodal DFlash does not support context parallelism yet.")
+
+        layers = self._get_transformer_layers()
+        captured: dict[int, torch.Tensor] = {}
+        handles = []
+
+        def _make_hook(layer_id: int):
+            def _hook(_module, _inputs, outputs):
+                captured[layer_id] = outputs[0] if isinstance(outputs, tuple) else outputs
+
+            return _hook
+
+        for layer_id in self.target_layer_ids:
+            handles.append(layers[layer_id].register_forward_hook(_make_hook(layer_id)))
+
+        forward_params = inspect.signature(self.model.forward).parameters
+        extra_kwargs = {
+            name: False for name in ("output_hidden_states", "output_attentions", "use_cache") if name in forward_params
+        }
+        multimodal_inputs = {
+            name: value
+            for name, value in {
+                "pixel_values": pixel_values,
+                "image_grid_thw": image_grid_thw,
+                "pixel_values_videos": pixel_values_videos,
+                "video_grid_thw": video_grid_thw,
+                "mm_token_type_ids": mm_token_type_ids,
+                "position_ids": position_ids,
+            }.items()
+            if value is not None and name in forward_params
+        }
+        try:
+            output = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **multimodal_inputs,
+                **extra_kwargs,
+            )
+            self._check_captured(captured)
+            logits = getattr(output, "logits", output) if self.capture_logits else None
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        hidden_states = torch.cat([captured[layer_id] for layer_id in self.target_layer_ids], dim=-1)
+        return DFlashTargetBatch(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            logits=logits,
+            position_ids=position_ids,
         )

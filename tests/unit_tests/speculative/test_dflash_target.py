@@ -28,7 +28,11 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutput
 
-from nemo_automodel.components.speculative.dflash.target import DFlashTargetBatch, HFDFlashTargetModel
+from nemo_automodel.components.speculative.dflash.target import (
+    DFlashTargetBatch,
+    HFDFlashTargetModel,
+    HFMultimodalDFlashTargetModel,
+)
 
 _FORBIDDEN_HF_FLAGS = {"output_hidden_states", "output_attentions", "use_cache"}
 _VOCAB = 32
@@ -107,6 +111,78 @@ class _FakeCustomCausalLM(nn.Module):
     def forward(self, input_ids, attention_mask=None, **attn_kwargs):
         h = self.model(input_ids, attention_mask=attention_mask, **attn_kwargs)
         return self.lm_head(h)
+
+
+class _FakeMultimodalBackbone(nn.Module):
+    """VLM backbone that replaces image-token embeddings from pixel features."""
+
+    def __init__(self, embed: nn.Embedding) -> None:
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.layers = nn.ModuleList([nn.Linear(_HIDDEN, _HIDDEN) for _ in range(_LAYERS)])
+        self._embed = embed
+
+    def forward(self, input_ids, pixel_values):
+        """Run a fake multimodal forward.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+            pixel_values: Tensor of shape [batch, hidden].
+
+        Returns:
+            Tensor of shape [batch, sequence, hidden].
+        """
+        hidden = self._embed(input_ids) + pixel_values[:, None, :]
+        for layer in self.language_model.layers:
+            hidden = layer(hidden)
+        return hidden
+
+
+class _FakeMultimodalLM(nn.Module):
+    """Image-text target with language layers below ``model.language_model``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = type("Cfg", (), {"num_hidden_layers": _LAYERS})
+        self.embed_tokens = nn.Embedding(_VOCAB, _HIDDEN)
+        self.model = _FakeMultimodalBackbone(self.embed_tokens)
+        self.lm_head = nn.Linear(_HIDDEN, _VOCAB, bias=False)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        pixel_values_videos=None,
+        video_grid_thw=None,
+        mm_token_type_ids=None,
+        position_ids=None,
+        use_cache=False,
+    ):
+        """Return logits for a processor-shaped image-text batch.
+
+        Args:
+            input_ids: Long tensor of shape [batch, sequence].
+            attention_mask: Optional tensor of shape [batch, sequence].
+            pixel_values: Tensor of shape [batch, hidden].
+            image_grid_thw: Long tensor of shape [images, 3].
+            use_cache: Whether to return a KV cache; unused by this test model.
+
+        Returns:
+            Causal-LM output with logits of shape [batch, sequence, vocab].
+        """
+        hidden = self.model(input_ids, pixel_values)
+        self.forward_inputs = {
+            "pixel_values_videos": pixel_values_videos,
+            "video_grid_thw": video_grid_thw,
+            "mm_token_type_ids": mm_token_type_ids,
+            "position_ids": position_ids,
+        }
+        return CausalLMOutput(logits=self.lm_head(hidden))
 
 
 def _batch(batch: int = 2, seq: int = 8):
@@ -197,3 +273,52 @@ def test_capture_logits_handles_bare_tensor_return():
     out = target.generate_batch(*_batch(batch=2, seq=8))
     assert out.logits is not None
     assert out.logits.shape == (2, 8, _VOCAB)
+
+
+def test_multimodal_target_captures_language_layers_with_pixels():
+    target = HFMultimodalDFlashTargetModel(_FakeMultimodalLM(), target_layer_ids=[1, 3])
+    input_ids, attention_mask, loss_mask = _batch(batch=2, seq=8)
+    loss_mask[:, :4] = 0
+    pixel_values = torch.randn(2, _HIDDEN)
+
+    output = target.generate_batch(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        pixel_values=pixel_values,
+        image_grid_thw=torch.tensor([[1, 2, 2], [1, 2, 2]]),
+    )
+
+    assert output.hidden_states.shape == (2, 8, 2 * _HIDDEN)
+    assert torch.equal(output.input_ids, input_ids)
+    assert torch.equal(output.loss_mask, loss_mask)
+    assert output.loss_mask[:, :4].count_nonzero() == 0
+
+
+def test_multimodal_target_forwards_qwen3_vl_processor_tensors():
+    model = _FakeMultimodalLM()
+    target = HFMultimodalDFlashTargetModel(model, target_layer_ids=[1, 3])
+    input_ids, attention_mask, loss_mask = _batch(batch=2, seq=8)
+    pixel_values = torch.randn(2, _HIDDEN)
+    video_pixels = torch.randn(3, _HIDDEN)
+    video_grid = torch.tensor([[1, 1, 3]])
+    token_types = torch.zeros_like(input_ids)
+    position_ids = torch.arange(input_ids.shape[1]).expand_as(input_ids)
+
+    output = target.generate_batch(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        pixel_values=pixel_values,
+        image_grid_thw=torch.tensor([[1, 1, 2]]),
+        pixel_values_videos=video_pixels,
+        video_grid_thw=video_grid,
+        mm_token_type_ids=token_types,
+        position_ids=position_ids,
+    )
+
+    assert torch.equal(model.forward_inputs["pixel_values_videos"], video_pixels)
+    assert torch.equal(model.forward_inputs["video_grid_thw"], video_grid)
+    assert torch.equal(model.forward_inputs["mm_token_type_ids"], token_types)
+    assert torch.equal(model.forward_inputs["position_ids"], position_ids)
+    assert torch.equal(output.position_ids, position_ids)

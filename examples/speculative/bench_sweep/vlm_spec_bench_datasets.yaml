@@ -1,0 +1,32 @@
+datasets:
+  - name: gqa
+    input_data: lmms-lab/GQA
+    dataset_name: testdev_balanced_instructions
+    split: testdev
+    benchmark_adapter: gqa
+    max_new_tokens: 64
+
+  - name: textvqa
+    input_data: lmms-lab/textvqa
+    split: validation
+    benchmark_adapter: textvqa
+    max_new_tokens: 64
+
+  - name: coco_caption
+    input_data: lmms-lab/COCO-Caption2017
+    split: val
+    benchmark_adapter: coco_caption
+    max_new_tokens: 128
+
+  - name: charxiv_reasoning
+    input_data: princeton-nlp/CharXiv
+    split: validation
+    benchmark_adapter: charxiv_reasoning
+    max_new_tokens: 256
+
+  - name: mmmu_pro
+    input_data: MMMU/MMMU_Pro
+    dataset_name: standard (4 options)
+    split: test
+    benchmark_adapter: mmmu_pro
+    max_new_tokens: 256

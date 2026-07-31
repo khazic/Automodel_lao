@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from transformers import DynamicCache
 
 from nemo_automodel.components.speculative.eagle.msd_decode import (
     MSDGreedyDecoder,
@@ -30,6 +31,12 @@ from nemo_automodel.components.speculative.eagle.msd_decode import (
     verify_greedy_tree,
     verify_hf_greedy_tree,
     verify_stochastic_chain,
+)
+from nemo_automodel.components.speculative.eagle.vispec_decode import VispecCachedGreedyDecoder
+from nemo_automodel.components.speculative.eagle.vispec_target import (
+    HFVispecTargetModel,
+    VispecGenerationState,
+    VispecTreeTargetOutput,
 )
 
 
@@ -393,3 +400,224 @@ def test_msd_greedy_decoder_runs_recursive_draft_and_tree_verification() -> None
     assert proposal.root_token_id == 2
     assert proposal.candidate_paths() == ((2, 2),)
     assert result.emitted_token_ids == (2, 3)
+
+
+class _TinyCachedTarget:
+    """Deterministic target implementing the cached ViSpec target contract."""
+
+    def __init__(self) -> None:
+        self.model = _TinyDecodeModel()
+
+    def get_lm_head(self) -> nn.Module:
+        """Return the identity language head."""
+        return self.model.lm_head
+
+    def get_input_embeddings(self) -> nn.Module:
+        """Return one-hot token embeddings."""
+        return self.model.embeddings
+
+    def prefill_generation(self, model_inputs: dict[str, torch.Tensor]) -> VispecGenerationState:
+        """Create a deterministic cached state for a batch-one token prefix.
+
+        Args:
+            model_inputs: Mapping containing ``input_ids`` and ``attention_mask``
+                tensors of shape [1, sequence].
+
+        Returns:
+            Fake state with tensor layouts documented by
+            :class:`VispecGenerationState`.
+        """
+        input_ids = model_inputs["input_ids"]
+        attention_mask = model_inputs["attention_mask"]
+        embeddings = self.model.embeddings(input_ids)
+        next_token = int(self.model.successor[input_ids[0, -1]].item())
+        return VispecGenerationState(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=embeddings,
+            input_hidden_states=embeddings,
+            image_mask=torch.zeros_like(input_ids, dtype=torch.bool),
+            next_token_logits=_logits(next_token),
+            past_key_values=DynamicCache(),
+        )
+
+    def forward_tree_generation(
+        self,
+        state: VispecGenerationState,
+        *,
+        token_ids: torch.Tensor,
+        tree_attention_mask: torch.Tensor,
+        tree_position_ids: torch.Tensor,
+    ) -> VispecTreeTargetOutput:
+        """Return deterministic logits for one flattened fake target tree.
+
+        Args:
+            state: Cached fake target state with tensor layouts documented by
+                :class:`VispecGenerationState`.
+            token_ids: Tensor of shape [1, tree] in tree-node order.
+            tree_attention_mask: Bool tensor of shape [tree, tree].
+            tree_position_ids: Tensor of shape [tree] containing node depths.
+
+        Returns:
+            Fake target output with layouts documented by
+            :class:`VispecTreeTargetOutput`.
+        """
+        del tree_attention_mask, tree_position_ids
+        embeddings = self.model.embeddings(token_ids)
+        logits = torch.cat([_logits(int(self.model.successor[token_id].item())) for token_id in token_ids[0]], dim=0)
+        return VispecTreeTargetOutput(
+            token_ids=token_ids,
+            inputs_embeds=embeddings,
+            hidden_states=embeddings,
+            logits=logits.unsqueeze(0),
+            prefix_length=state.input_ids.shape[1],
+        )
+
+    def commit_tree_generation(
+        self,
+        state: VispecGenerationState,
+        tree_output: VispecTreeTargetOutput,
+        *,
+        accepted_tree_indices: torch.Tensor,
+    ) -> VispecGenerationState:
+        """Append the accepted fake tree path without appending the bonus token.
+
+        Args:
+            state: Cached fake target state with tensor layouts documented by
+                :class:`VispecGenerationState`.
+            tree_output: Fake target output with layouts documented by
+                :class:`VispecTreeTargetOutput`.
+            accepted_tree_indices: Tensor of shape [accepted] containing the
+                root-to-leaf accepted tree-node indices.
+
+        Returns:
+            Fake target state extended by the accepted path.
+        """
+        tokens = tree_output.token_ids.index_select(1, accepted_tree_indices)
+        embeddings = tree_output.inputs_embeds.index_select(1, accepted_tree_indices)
+        attention_mask = torch.cat((state.attention_mask, torch.ones_like(tokens)), dim=1)
+        return VispecGenerationState(
+            input_ids=torch.cat((state.input_ids, tokens), dim=1),
+            attention_mask=attention_mask,
+            inputs_embeds=torch.cat((state.inputs_embeds, embeddings), dim=1),
+            input_hidden_states=torch.cat((state.input_hidden_states, embeddings), dim=1),
+            image_mask=torch.cat((state.image_mask, torch.zeros_like(tokens, dtype=torch.bool)), dim=1),
+            next_token_logits=tree_output.logits[:, accepted_tree_indices[-1]],
+            past_key_values=state.past_key_values,
+        )
+
+
+class _TinyCachedDraft(_IdentityFeatureDraft):
+    """Identity draft exposing the minimal cached ViSpec inference contract."""
+
+    def _prefill_generation(
+        self,
+        inputs_embeds: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        image_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...], torch.Tensor]:
+        """Return the last embedding and a shape-compatible fake KV cache.
+
+        Args:
+            inputs_embeds: Tensor of shape [1, sequence, hidden].
+            target_hidden_states: Tensor of shape [1, sequence, hidden].
+            attention_mask: Tensor of shape [1, sequence].
+            image_mask: Bool tensor of shape [1, sequence].
+
+        Returns:
+            Last hidden state of shape [1, hidden], one fake layer whose K/V
+            tensors have shape [1, 1, sequence, 1], and a global image feature
+            of shape [1, hidden].
+        """
+        del target_hidden_states, attention_mask, image_mask
+        cache_tensor = torch.zeros(1, 1, inputs_embeds.shape[1], 1)
+        return inputs_embeds[:, -1], ((cache_tensor, cache_tensor),), torch.zeros_like(inputs_embeds[0, :1])
+
+    def _decode_generation(
+        self,
+        inputs_embeds: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        global_image_feature: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...],
+    ) -> tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
+        """Return token embeddings and append shape-only fake cache entries.
+
+        Args:
+            inputs_embeds: Tensor of shape [1, query, hidden].
+            target_hidden_states: Tensor of shape [1, query, hidden].
+            global_image_feature: Tensor of shape [1, hidden].
+            position_ids: Long tensor of shape [1, query].
+            attention_mask: Additive tensor of shape [1, 1, query, cached + query].
+            past_key_values: One fake layer whose K/V tensors have shape
+                [1, 1, cached, 1].
+
+        Returns:
+            Hidden states of shape [1, query, hidden] and one fake layer whose
+            K/V tensors have shape [1, 1, cached + query, 1].
+        """
+        del target_hidden_states, global_image_feature, position_ids, attention_mask
+        cache_tensor = torch.zeros(1, 1, inputs_embeds.shape[1], 1)
+        next_cache = tuple(
+            ((torch.cat((key, cache_tensor), dim=-2), torch.cat((value, cache_tensor), dim=-2)))
+            for key, value in past_key_values
+        )
+        return inputs_embeds, next_cache
+
+
+def test_cached_vispec_decoder_commits_accepted_path_and_defers_bonus() -> None:
+    """Cached verification commits accepted tokens while leaving its bonus pending."""
+    decoder = VispecCachedGreedyDecoder(_TinyCachedTarget(), _TinyCachedDraft())
+    decoder.prefill({"input_ids": torch.tensor([[0, 1]]), "attention_mask": torch.ones(1, 2)})
+
+    proposal, result = decoder.decode_round(draft_steps=1, top_k=1, beam_width=1)
+
+    assert proposal.candidate_paths() == ((2, 2),)
+    assert result.emitted_token_ids == (2, 3)
+    assert decoder.state is not None
+    assert decoder.state.input_ids.tolist() == [[0, 1, 2]]
+
+
+def test_vispec_tree_commit_compacts_selected_dynamic_cache_positions() -> None:
+    """Tree commit reuses storage and retains selected K/V entries in path order."""
+    cache = DynamicCache()
+    prefix_keys = torch.tensor([[[[1.0], [2.0]]]])
+    prefix_values = prefix_keys + 10.0
+    cache.update(prefix_keys, prefix_values, 0)
+    wrapper = object.__new__(HFVispecTargetModel)
+    wrapper._preallocate_generation_cache(cache)
+    storage_pointer = cache.layers[0].keys.untyped_storage().data_ptr()
+    tree_keys = torch.tensor([[[[3.0], [4.0], [5.0]]]])
+    tree_values = tree_keys + 10.0
+    cache.update(tree_keys, tree_values, 0)
+    assert cache.layers[0].keys.untyped_storage().data_ptr() == storage_pointer
+    state = VispecGenerationState(
+        input_ids=torch.tensor([[7, 8]]),
+        attention_mask=torch.ones(1, 2),
+        inputs_embeds=torch.zeros(1, 2, 2),
+        input_hidden_states=torch.zeros(1, 2, 2),
+        image_mask=torch.zeros(1, 2, dtype=torch.bool),
+        next_token_logits=torch.zeros(1, 16),
+        past_key_values=cache,
+    )
+    tree_output = VispecTreeTargetOutput(
+        token_ids=torch.tensor([[9, 10, 11]]),
+        inputs_embeds=torch.arange(6, dtype=torch.float32).view(1, 3, 2),
+        hidden_states=torch.arange(6, 12, dtype=torch.float32).view(1, 3, 2),
+        logits=torch.arange(48, dtype=torch.float32).view(1, 3, 16),
+        prefix_length=2,
+    )
+    committed = wrapper.commit_tree_generation(
+        state,
+        tree_output,
+        accepted_tree_indices=torch.tensor([0, 2]),
+    )
+
+    assert committed.input_ids.tolist() == [[7, 8, 9, 11]]
+    assert committed.past_key_values.get_seq_length() == 4
+    assert committed.past_key_values.layers[0].keys.flatten().tolist() == [1.0, 2.0, 3.0, 5.0]
+    assert committed.past_key_values.layers[0].values.flatten().tolist() == [11.0, 12.0, 13.0, 15.0]
+    assert committed.past_key_values.layers[0].keys.untyped_storage().data_ptr() == storage_pointer
+    assert torch.equal(committed.next_token_logits, tree_output.logits[:, 2])

@@ -33,11 +33,14 @@ class DFlashDraftSpec:
     """How to build a DFlash draft model for a particular target architecture."""
 
     draft_cls: type[PreTrainedModel]
+    is_multimodal: bool = False
 
 
 # Qwen3-shaped dense / MoE targets. The DFlash draft only consumes post-block
 # hidden states captured via forward hooks, so an MoE target (e.g.
-# ``Qwen3MoeForCausalLM``) is handled identically to a dense one.
+# ``Qwen3MoeForCausalLM``) is handled identically to a dense one. Multimodal
+# targets opt into the same draft separately because their target execution and
+# dataloader contracts include processor-produced vision tensors.
 _QWEN3_ARCHITECTURES: tuple[str, ...] = (
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
@@ -47,6 +50,15 @@ _QWEN3_ARCHITECTURES: tuple[str, ...] = (
 DFLASH_DRAFT_REGISTRY: dict[str, DFlashDraftSpec] = {
     arch: DFlashDraftSpec(draft_cls=Qwen3DFlashDraftModel) for arch in _QWEN3_ARCHITECTURES
 }
+DFLASH_DRAFT_REGISTRY["Qwen2_5_VLForConditionalGeneration"] = DFlashDraftSpec(
+    draft_cls=Qwen3DFlashDraftModel,
+    is_multimodal=True,
+)
+for architecture in ("Qwen3VLForConditionalGeneration", "Qwen3VLMoeForConditionalGeneration"):
+    DFLASH_DRAFT_REGISTRY[architecture] = DFlashDraftSpec(
+        draft_cls=Qwen3DFlashDraftModel,
+        is_multimodal=True,
+    )
 
 
 def resolve_dflash_draft_spec(architectures: list[str]) -> DFlashDraftSpec:

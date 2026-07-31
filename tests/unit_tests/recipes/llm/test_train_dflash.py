@@ -30,7 +30,7 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import Qwen3DFlashDraftModel
 from nemo_automodel.recipes.llm import train_dflash
-from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe
+from nemo_automodel.recipes.llm.train_dflash import TrainDFlashRecipe, _build_draft_config, _target_forward_kwargs
 
 _VOCAB = 64
 _HIDDEN = 32
@@ -69,6 +69,125 @@ def _bare_dflash_recipe():
         get_input_embeddings=lambda: torch.nn.Embedding(_VOCAB, _HIDDEN),
     )
     return recipe
+
+
+def test_build_draft_config_maps_multimodal_text_config_to_qwen3():
+    text_config = SimpleNamespace(
+        to_dict=lambda: {
+            "vocab_size": _VOCAB,
+            "hidden_size": _HIDDEN,
+            "intermediate_size": 64,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 64,
+            "rope_parameters": {"type": "mrope", "mrope_section": [2, 3, 3], "rope_theta": 1000000.0},
+            "tie_word_embeddings": False,
+        }
+    )
+
+    config = _build_draft_config(
+        text_config,
+        draft_num_hidden_layers=2,
+        num_target_layers=8,
+        block_size=4,
+        dflash_config={"mask_token_id": _MASK_ID, "target_layer_ids": [1, 3]},
+        attention_backend="sdpa",
+    )
+
+    assert isinstance(config, Qwen3Config)
+    assert config.num_hidden_layers == 2
+    assert config.num_target_layers == 8
+    assert "mrope_section" not in config.rope_scaling
+    assert config.rope_scaling["rope_type"] == "default"
+    assert config.rope_scaling["rope_theta"] == 1000000.0
+    assert config.dflash_config["mask_token_id"] == _MASK_ID
+
+
+def test_target_forward_kwargs_preserves_multimodal_tensors():
+    batch = {
+        "input_ids": torch.ones(1, 8, dtype=torch.long),
+        "attention_mask": torch.ones(1, 8, dtype=torch.long),
+        "loss_mask": torch.ones(1, 8, dtype=torch.long),
+        "pixel_values": torch.randn(16, 12),
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+    }
+
+    result = _target_forward_kwargs(batch)
+
+    assert set(result) == {"pixel_values", "image_grid_thw"}
+    assert result["pixel_values"] is batch["pixel_values"]
+    assert result["image_grid_thw"] is batch["image_grid_thw"]
+
+
+def test_build_multimodal_dataloader_uses_vlm_processor(monkeypatch):
+    captured = {}
+    expected = object()
+
+    def _fake_build(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(train_dflash, "build_dspark_vlm_dataloader", _fake_build)
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.is_multimodal = True
+    recipe.processor = object()
+    recipe.dist_env = SimpleNamespace(world_size=1)
+    recipe.dp_mesh = None
+    recipe_cfg = SimpleNamespace(
+        micro_batch_size=1,
+        seq_length=4096,
+        get=lambda key, default=None: 2 if key == "num_workers" else default,
+    )
+    dataset_cfg = object()
+
+    result = recipe._build_dataloader(
+        recipe_cfg=recipe_cfg,
+        dataset_cfg=dataset_cfg,
+        train=True,
+        packed_sequence_size=0,
+    )
+
+    assert result is expected
+    assert captured["dataset_cfg"] is dataset_cfg
+    assert captured["processor"] is recipe.processor
+    assert captured["inject_fake_image"] is False
+    assert captured["max_length"] == 4096
+
+
+def test_build_multimodal_target_uses_image_text_auto_model(monkeypatch):
+    calls = {}
+    target = SimpleNamespace(
+        to=lambda device: calls.setdefault("device", device),
+        requires_grad_=lambda enabled: calls.setdefault("requires_grad", enabled),
+    )
+
+    def _fake_from_pretrained(path, **kwargs):
+        calls["path"] = path
+        calls["kwargs"] = kwargs
+        return target
+
+    monkeypatch.setattr(
+        train_dflash,
+        "AutoModelForImageTextToText",
+        SimpleNamespace(from_pretrained=_fake_from_pretrained),
+    )
+    recipe = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    recipe.is_multimodal = True
+    recipe.cfg = {"distributed": None}
+    recipe.dist_env = SimpleNamespace(world_size=1)
+    recipe.device = torch.device("cpu")
+    recipe.compute_dtype = torch.float32
+
+    result = recipe._build_target_model({}, "target/path")
+
+    assert result is target
+    assert calls["path"] == "target/path"
+    assert calls["kwargs"]["torch_dtype"] == torch.float32
+    assert "force_hf" not in calls["kwargs"]
+    assert calls["device"] == torch.device("cpu")
+    assert calls["requires_grad"] is False
 
 
 def _ckpt_self(ckpt_every_steps, save_every_epoch, global_step, total_optim_steps=None):
@@ -203,9 +322,9 @@ def test_build_checkpointer_logs_retention_policy(tmp_path, monkeypatch, caplog)
     monkeypatch.setattr(train_dflash, "Checkpointer", FakeCheckpointer)
     obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
     obj.cfg = SimpleNamespace(
-        get=lambda key, default=None: {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1}
-        if key == "checkpoint"
-        else default
+        get=lambda key, default=None: (
+            {"checkpoint_dir": str(tmp_path), "max_recent_checkpoints": 1} if key == "checkpoint" else default
+        )
     )
     obj.output_dir = tmp_path
     obj.draft_model = SimpleNamespace(state_dict=lambda: {"weight": torch.zeros(1)})
@@ -242,6 +361,58 @@ def test_run_train_validation_loop_finalizes_before_close():
     TrainDFlashRecipe.run_train_validation_loop(obj)
 
     assert events == [("final", 1), "finalize", "close", "pbar_close"]
+
+
+def test_run_train_validation_loop_resumes_at_next_batch():
+    processed_batches = []
+
+    obj = TrainDFlashRecipe.__new__(TrainDFlashRecipe)
+    obj.trainer_module = torch.nn.Linear(1, 1)
+    obj.num_epochs = 1
+    obj._resume_epoch = 0
+    obj._resume_batch_idx = 2
+    obj.dist_env = SimpleNamespace(is_main=False)
+    obj.total_optim_steps = 4
+    obj.runtime = SimpleNamespace(global_step=2)
+    obj.train_dataloader = [
+        {
+            "input_ids": torch.tensor([[batch_idx]]),
+            "attention_mask": torch.ones(1, 1, dtype=torch.long),
+            "loss_mask": torch.ones(1, 1, dtype=torch.long),
+        }
+        for batch_idx in range(4)
+    ]
+    obj.device = torch.device("cpu")
+    obj.target_wrapper = SimpleNamespace(
+        generate_batch=lambda **batch: processed_batches.append(batch["input_ids"].item())
+        or SimpleNamespace(input_ids=batch["input_ids"])
+    )
+    parameter = next(obj.trainer_module.parameters())
+    obj._run_trainer_step = lambda batch: SimpleNamespace(
+        loss=parameter.square(),
+        accuracy=torch.tensor(1.0),
+        accept_len_sum=torch.tensor(1.0),
+        valid_blocks=torch.tensor(1.0),
+    )
+    obj.grad_accumulation_steps = 1
+    obj.max_grad_norm = 1.0
+    obj.optimizer = torch.optim.SGD([parameter], lr=0.1)
+    obj.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(obj.optimizer, lambda _: 1.0)
+    obj._skipped_micro_batches = 0
+    obj.log_every_steps = 100
+    obj.save_checkpoint_every_epoch = False
+    obj.ckpt_every_steps = None
+    obj._make_progress_bar = lambda **kwargs: None
+    obj._run_eval = lambda: None
+    obj._maybe_save_step_checkpoint = lambda epoch_idx: False
+    obj._maybe_save_final_checkpoint = lambda completed_epochs: False
+    obj._finalize_and_close_checkpointer = lambda: None
+
+    TrainDFlashRecipe.run_train_validation_loop(obj)
+
+    assert processed_batches == [2, 3]
+    assert obj.runtime.global_step == 4
+    assert obj._next_batch_idx == 0
 
 
 def test_resolve_mask_token_id_prefers_explicit():
@@ -416,6 +587,7 @@ def _load_extra_state_self(mask_token_id=7):
     return SimpleNamespace(
         runtime=SimpleNamespace(global_step=0),
         _resume_epoch=0,
+        _resume_batch_idx=0,
         mask_token_id=mask_token_id,
         checkpoint_config=SimpleNamespace(allow_legacy_pickle_restore=False),
     )
@@ -428,12 +600,30 @@ def _write_meta(tmp_path, **fields):
     return str(tmp_path)
 
 
-def test_load_extra_state_restores_step_and_epoch(tmp_path):
-    ckpt_dir = _write_meta(tmp_path, mask_token_id=7)
+def test_save_extra_state_records_next_batch(tmp_path):
+    obj = SimpleNamespace(
+        runtime=SimpleNamespace(global_step=5),
+        _next_batch_idx=17,
+        block_size=16,
+        mask_token_id=7,
+        target_wrapper=SimpleNamespace(target_layer_ids=[1, 2]),
+    )
+
+    TrainDFlashRecipe._save_extra_state(obj, str(tmp_path), epoch=2)
+
+    meta = torch.load(tmp_path / "dflash_meta.pt", map_location="cpu", weights_only=True)
+    assert meta["global_step"] == 5
+    assert meta["epoch"] == 2
+    assert meta["next_batch_idx"] == 17
+
+
+def test_load_extra_state_restores_step_epoch_and_batch(tmp_path):
+    ckpt_dir = _write_meta(tmp_path, mask_token_id=7, next_batch_idx=17)
     obj = _load_extra_state_self(mask_token_id=7)
     TrainDFlashRecipe._load_extra_state(obj, ckpt_dir)
     assert obj.runtime.global_step == 5
     assert obj._resume_epoch == 2
+    assert obj._resume_batch_idx == 17
 
 
 def test_load_extra_state_raises_on_mask_token_id_mismatch(tmp_path):
@@ -452,6 +642,7 @@ def test_load_extra_state_accepts_legacy_meta_without_mask_token_id(tmp_path):
     TrainDFlashRecipe._load_extra_state(obj, str(tmp_path))
     assert obj.runtime.global_step == 3
     assert obj._resume_epoch == 1
+    assert obj._resume_batch_idx == 0
 
 
 def test_load_extra_state_noop_when_meta_missing(tmp_path):

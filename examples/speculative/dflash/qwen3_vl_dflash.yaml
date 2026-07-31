@@ -1,0 +1,50 @@
+# DFlash draft training for dense Qwen3-VL. The frozen target runs its vision
+# tower and language decoder; the Qwen3-style draft consumes selected decoder
+# hidden states and is supervised only on assistant-response tokens.
+
+recipe: TrainDFlashRecipe
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+recipe_args:
+  target_model_name_or_path: Qwen/Qwen3-VL-4B-Instruct
+  output_dir: ./outputs/dflash_qwen3_vl_4b
+  seq_length: 4096
+  image_max_pixels: 802816
+  micro_batch_size: 1
+  grad_accumulation_steps: 8
+  num_workers: 4
+  num_epochs: 6
+
+  draft_num_hidden_layers: 5
+  block_size: 16
+  num_anchors: 512
+  loss_decay_gamma: 7.0
+  # Qwen3-VL's <|fim_middle|> token. The serving runtime must use the same id.
+  mask_token_id: 151660
+  attention_backend: flex_attention
+
+  trust_remote_code: false
+  shuffle_seed: 42
+  log_every_steps: 10
+  max_grad_norm: 1.0
+
+dataset:
+  _target_: nemo_automodel.components.datasets.vlm.datasets.make_meta_dataset
+  path_or_dataset: /path/to/qwen3_vl_regenerated/meta.json
+  split: train
+
+optimizer:
+  lr: 6.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  warmup_ratio: 0.04
+  min_lr_ratio: 0.1
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: ./outputs/dflash_qwen3_vl_4b/checkpoints
+  model_save_format: safetensors
+  save_consolidated: true

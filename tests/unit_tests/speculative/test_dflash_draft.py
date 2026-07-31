@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import torch
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -125,3 +127,42 @@ def test_draft_forward_output_shape():
     out = draft(position_ids=position_ids, attention_mask=None, noise_embedding=noise, target_hidden=target_hidden)
     assert out.shape == (B, Q, H)
     assert torch.isfinite(out).all()
+
+
+def test_draft_sdpa_matches_eager_in_fp32():
+    """The inference SDPA path must preserve the eager attention result."""
+    torch.manual_seed(7)
+    eager_cfg = _draft_cfg()
+    eager_cfg._attn_implementation = "eager"
+    sdpa_cfg = deepcopy(eager_cfg)
+    sdpa_cfg._attn_implementation = "sdpa"
+
+    eager_draft = Qwen3DFlashDraftModel(eager_cfg).eval()
+    sdpa_draft = Qwen3DFlashDraftModel(sdpa_cfg).eval()
+    sdpa_draft.load_state_dict(eager_draft.state_dict())
+
+    batch_size, context_length, num_blocks = 2, 7, 2
+    query_length = num_blocks * eager_cfg.block_size
+    noise = torch.randn(batch_size, query_length, eager_cfg.hidden_size)
+    target_hidden = torch.randn(
+        batch_size,
+        context_length,
+        len(eager_cfg.dflash_config["target_layer_ids"]) * eager_cfg.hidden_size,
+    )
+    position_ids = torch.arange(context_length + query_length).unsqueeze(0).expand(batch_size, -1)
+
+    with torch.inference_mode():
+        eager_output = eager_draft(
+            position_ids=position_ids,
+            attention_mask=None,
+            noise_embedding=noise,
+            target_hidden=target_hidden,
+        )
+        sdpa_output = sdpa_draft(
+            position_ids=position_ids,
+            attention_mask=None,
+            noise_embedding=noise,
+            target_hidden=target_hidden,
+        )
+
+    torch.testing.assert_close(sdpa_output, eager_output, rtol=1e-5, atol=1e-6)

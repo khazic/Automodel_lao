@@ -26,6 +26,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig, PreTrainedModel
 
 from nemo_automodel.components.datasets.llm.packed_sequence import build_block_causal_additive_mask
@@ -90,6 +91,7 @@ class EagleLlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.scaling = self.head_dim**-0.5
+        self.use_sdpa_attention = bool(getattr(config, "draft_use_sdpa_attention", False))
 
         qkv_bias, o_proj_bias = resolve_attention_bias(config)
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=qkv_bias)
@@ -127,12 +129,87 @@ class EagleLlamaAttention(nn.Module):
         k = self._repeat_kv(k)
         v = self._repeat_kv(v)
 
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
-        attn_weights = attn_weights + attention_mask
-        attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(v.dtype)
-        attn_output = torch.matmul(attn_probs, v)
+        if self.use_sdpa_attention:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                attn_mask=attention_mask.to(q.dtype),
+            )
+        else:
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+            attn_weights = attn_weights + attention_mask
+            attn_probs = torch.softmax(attn_weights.float(), dim=-1).to(v.dtype)
+            attn_output = torch.matmul(attn_probs, v)
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
+
+    def _forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Run inference attention while appending to a draft KV cache.
+
+        Args:
+            hidden_states: Tensor of shape [1, query, hidden].
+            attention_mask: Additive tensor of shape [1, 1, query, cached + query].
+            position_ids: Long tensor of shape [1, query].
+            past_key_value: Optional pair of tensors, each of shape
+                [1, kv_heads, cached, head_dim].
+
+        Returns:
+            Attention output of shape [1, query, hidden] and a new key/value
+            pair of shape [1, kv_heads, cached + query, head_dim].
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        q = self.q_proj(hidden_states).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = (
+            self.k_proj(hidden_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(hidden_states)
+            .view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        cos, sin = self.rotary_emb(hidden_states, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if past_key_value is not None:
+            k = torch.cat((past_key_value[0], k), dim=-2)
+            v = torch.cat((past_key_value[1], v), dim=-2)
+        next_key_value = (k, v)
+        repeated_k = self._repeat_kv(k)
+        repeated_v = self._repeat_kv(v)
+        if self.use_sdpa_attention:
+            if q.device.type == "cuda":
+                # cuDNN SDPA rebuilds execution plans as the cached prefix grows
+                # between ViSpec rounds. Efficient attention supports the same
+                # arbitrary additive tree mask without that dynamic-shape host
+                # overhead; math remains a compatibility fallback.
+                with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                    attn_output = torch.nn.functional.scaled_dot_product_attention(
+                        q.contiguous(),
+                        repeated_k.contiguous(),
+                        repeated_v.contiguous(),
+                        attn_mask=attention_mask.to(q.dtype),
+                    )
+            else:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    q.contiguous(),
+                    repeated_k.contiguous(),
+                    repeated_v.contiguous(),
+                    attn_mask=attention_mask.to(q.dtype),
+                )
+        else:
+            attn_weights = torch.matmul(q, repeated_k.transpose(-2, -1)) * self.scaling
+            attn_probs = torch.softmax((attn_weights + attention_mask).float(), dim=-1).to(repeated_v.dtype)
+            attn_output = torch.matmul(attn_probs, repeated_v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.o_proj(attn_output), next_key_value
 
 
 class EagleLlamaMLP(nn.Module):
@@ -158,11 +235,16 @@ class EagleLlamaMLP(nn.Module):
 class EagleLlamaDecoderLayer(nn.Module):
     """Single decoder layer for the minimal EAGLE-1/2 draft model."""
 
-    def __init__(self, config: PretrainedConfig):
+    def __init__(self, config: PretrainedConfig, layer_idx: int = 0):
         super().__init__()
         self.self_attn = EagleLlamaAttention(config)
         self.mlp = EagleLlamaMLP(config)
-        self.input_layernorm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
+        skip_input_norm = bool(getattr(config, "draft_skip_first_input_norm", False)) and layer_idx == 0
+        self.input_layernorm = (
+            None
+            if skip_input_norm
+            else initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
+        )
         self.post_attention_layernorm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -172,7 +254,8 @@ class EagleLlamaDecoderLayer(nn.Module):
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if self.input_layernorm is not None:
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask, position_ids=position_ids)
         hidden_states = residual + hidden_states
 
@@ -180,6 +263,41 @@ class EagleLlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
+
+    def _forward_cached(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Run one inference layer while appending to its KV cache.
+
+        Args:
+            hidden_states: Tensor of shape [1, query, hidden].
+            attention_mask: Additive tensor of shape [1, 1, query, cached + query].
+            position_ids: Long tensor of shape [1, query].
+            past_key_value: Optional pair of tensors, each of shape
+                [1, kv_heads, cached, head_dim].
+
+        Returns:
+            Hidden states of shape [1, query, hidden] and a key/value pair of
+            shape [1, kv_heads, cached + query, head_dim].
+        """
+        residual = hidden_states
+        if self.input_layernorm is not None:
+            hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, next_key_value = self.self_attn._forward_cached(
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_value,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states, next_key_value
 
 
 class LlamaEagleDraftModel(PreTrainedModel):
@@ -202,8 +320,12 @@ class LlamaEagleDraftModel(PreTrainedModel):
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=resolve_fc_bias(config))
         num_layers = max(1, int(getattr(config, "draft_num_hidden_layers", config.num_hidden_layers)))
-        self.layers = nn.ModuleList([EagleLlamaDecoderLayer(config) for _ in range(num_layers)])
-        self.norm = initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = nn.ModuleList([EagleLlamaDecoderLayer(config, layer_idx) for layer_idx in range(num_layers)])
+        self.norm = (
+            initialize_rms_norm_module("torch", config.hidden_size, eps=config.rms_norm_eps)
+            if bool(getattr(config, "draft_apply_final_norm", True))
+            else nn.Identity()
+        )
         self.post_init()
 
     def copy_embeddings_from_target(self, target_embeddings: nn.Embedding) -> None:

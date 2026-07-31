@@ -26,6 +26,21 @@ from nemo_automodel.components.speculative.dflash.registry import resolve_dflash
 def test_resolve_known_architectures(arch):
     spec = resolve_dflash_draft_spec([arch])
     assert spec.draft_cls is Qwen3DFlashDraftModel
+    assert spec.is_multimodal is False
+
+
+@pytest.mark.parametrize(
+    "arch",
+    [
+        "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+    ],
+)
+def test_resolve_multimodal_architecture(arch):
+    spec = resolve_dflash_draft_spec([arch])
+    assert spec.draft_cls is Qwen3DFlashDraftModel
+    assert spec.is_multimodal is True
 
 
 def test_resolve_first_match_wins():

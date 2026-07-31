@@ -29,10 +29,13 @@ mask that enforces this is built by the trainer wrapper in
 
 from __future__ import annotations
 
+import inspect
+from contextlib import AbstractContextManager, nullcontext
 from typing import Callable, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -136,17 +139,25 @@ class Qwen3DFlashAttention(nn.Module):
         attn_fn: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-        attn_output, attn_weights = attn_fn(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            **kwargs,
-        )
+        backend_context = nullcontext()
+        if not self.training and q.device.type == "cuda" and self.config._attn_implementation == "sdpa":
+            # DFlash changes the cached context length after nearly every block.
+            # cuDNN SDPA repeatedly plans those dynamic shapes, while efficient
+            # attention supports the same additive non-causal block mask without
+            # that host overhead. Keep math enabled for older CUDA architectures.
+            backend_context = sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+        with backend_context:
+            attn_output, attn_weights = attn_fn(
+                self,
+                q,
+                k,
+                v,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
         attn_output = attn_output.reshape(bsz, q_len, -1)
         return self.o_proj(attn_output), attn_weights
 
@@ -327,8 +338,33 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         max_new_tokens: int,
         stop_token_ids: Optional[list[int]],
         temperature: float,
-    ) -> torch.LongTensor:
-        """Block-parallel speculative decoding: draft a block, verify with the target, accept the matching prefix."""
+        target_kwargs: Optional[dict[str, torch.Tensor]] = None,
+        return_stats: bool = False,
+        sequential_target_verification: bool = False,
+    ) -> torch.LongTensor | tuple[torch.LongTensor, dict[str, float]]:
+        """Run block-parallel speculative decoding against a Transformers target.
+
+        Args:
+            target: Frozen Transformers target model. It must expose input
+                embeddings, an LM head, and a cache-aware forward method.
+            input_ids: Tensor of shape [1, prompt_tokens].
+            max_new_tokens: Maximum number of output tokens after the prompt.
+            stop_token_ids: Token ids that terminate generation, or ``None``.
+            temperature: Sampling temperature; values below ``1e-5`` use greedy
+                argmax decoding.
+            target_kwargs: Prompt tensors produced by the target processor. Text
+                masks have shape [1, prompt_tokens]; vision tensors retain the
+                target model's processor-defined flattened patch layout.
+            return_stats: Whether to return draft acceptance counters.
+            sequential_target_verification: Whether the target verifies draft
+                candidates one token at a time. This preserves parity with
+                ``generate()`` at the cost of target-side acceleration.
+
+        Returns:
+            Tensor of shape [1, prompt_tokens + generated_tokens]. When
+            ``return_stats`` is true, returns that tensor and a dictionary of
+            scalar draft, accepted, and verification-step counts.
+        """
         self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
@@ -338,18 +374,77 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             (1, max_length + block_size), self.mask_token_id, dtype=torch.long, device=target.device
         )
         position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
+        # Qwen2.5-VL derives 3-D MRoPE positions (and rope deltas) inside its
+        # model forward. Passing the text-only 2-D arange used by Qwen3 would
+        # silently disable multimodal RoPE, so let the VLM compute positions.
+        target_is_vlm = callable(getattr(getattr(target, "model", None), "compute_3d_position_ids", None))
+        target_forward_params = inspect.signature(target.forward).parameters
+        target_embeddings = target.get_input_embeddings()
         past_key_values_target = DynamicCache()
         past_key_values_draft = DynamicCache()
+        target_kwargs = dict(target_kwargs or {})
+        draft_tokens = 0
+        accepted_tokens = 0
+        verify_steps = 0
+        timing_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+            "target_prefill": [],
+            "draft": [],
+            "target_verify": [],
+        }
+
+        def start_timing() -> torch.cuda.Event | None:
+            if not return_stats or not torch.cuda.is_available():
+                return None
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
+
+        def end_timing(phase: str, start_event: torch.cuda.Event | None) -> None:
+            if start_event is None:
+                return
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            timing_events[phase].append((start_event, end_event))
+
+        def target_verify_backend() -> AbstractContextManager[None]:
+            target_config = getattr(target, "config", None)
+            if (
+                target.device.type == "cuda"
+                and target_config is not None
+                and getattr(target_config, "_attn_implementation", None) == "sdpa"
+            ):
+                # Verification repeatedly changes the cached sequence length.
+                # Avoid cuDNN SDPA plan construction for those short dynamic
+                # blocks while leaving the long target prefill unchanged.
+                return sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+            return nullcontext()
 
         # Prefill the target on the prompt.
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True,
-        )
+        if target_is_vlm:
+            prefill_kwargs = target.prepare_inputs_for_generation(
+                input_ids,
+                next_sequence_length=num_input_tokens,
+                past_key_values=past_key_values_target,
+                is_first_iteration=True,
+                use_cache=True,
+                **target_kwargs,
+            )
+            prefill_kwargs["logits_to_keep"] = 1
+            prefill_kwargs["output_hidden_states"] = True
+            prefill_input_ids = prefill_kwargs.pop("input_ids")
+        else:
+            prefill_kwargs = {
+                "past_key_values": past_key_values_target,
+                "use_cache": True,
+                "logits_to_keep": 1,
+                "output_hidden_states": True,
+                **target_kwargs,
+            }
+            prefill_kwargs["position_ids"] = position_ids[:, :num_input_tokens]
+            prefill_input_ids = input_ids
+        phase_start = start_timing()
+        output = target(prefill_input_ids, **prefill_kwargs)
+        end_timing("target_prefill", phase_start)
         output_ids[:, :num_input_tokens] = input_ids
         output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
         target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
@@ -358,7 +453,8 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
         while start < max_length:
             block_output_ids = output_ids[:, start : start + block_size].clone()
             block_position_ids = position_ids[:, start : start + block_size]
-            noise_embedding = target.model.embed_tokens(block_output_ids)
+            noise_embedding = target_embeddings(block_output_ids)
+            phase_start = start_timing()
             draft_logits = target.lm_head(
                 self(
                     target_hidden=target_hidden,
@@ -368,25 +464,170 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
                     use_cache=True,
                 )[:, -block_size + 1 :, :]
             )
+            end_timing("draft", phase_start)
             past_key_values_draft.crop(start)
             block_output_ids[:, 1:] = sample(draft_logits)
+            draft_tokens += int(block_output_ids.shape[1] - 1)
 
-            output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            posterior = sample(output.logits, temperature)
-            acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+            if sequential_target_verification:
+                posterior_tokens: list[torch.Tensor] = []
+                verified_hidden_states: list[torch.Tensor] = []
+                acceptance_length = 0
+                for block_index in range(block_output_ids.shape[1]):
+                    token_ids = block_output_ids[:, block_index : block_index + 1]
+                    if target_is_vlm:
+                        prompt_attention_mask = target_kwargs.get("attention_mask")
+                        if prompt_attention_mask is None:
+                            prompt_attention_mask = torch.ones_like(input_ids)
+                        active_length = start + block_index + 1
+                        full_attention_mask = torch.cat(
+                            (
+                                prompt_attention_mask,
+                                torch.ones(
+                                    (1, active_length - num_input_tokens),
+                                    dtype=prompt_attention_mask.dtype,
+                                    device=target.device,
+                                ),
+                            ),
+                            dim=1,
+                        )
+                        full_input_ids = torch.cat(
+                            (output_ids[:, : start + block_index], token_ids),
+                            dim=1,
+                        )
+                        generation_kwargs = {
+                            key: value
+                            for key, value in target_kwargs.items()
+                            if key not in {"attention_mask", "mm_token_type_ids", "pixel_values", "pixel_values_videos"}
+                        }
+                        verify_kwargs = target.prepare_inputs_for_generation(
+                            full_input_ids,
+                            next_sequence_length=1,
+                            past_key_values=past_key_values_target,
+                            attention_mask=full_attention_mask,
+                            is_first_iteration=False,
+                            use_cache=True,
+                            **generation_kwargs,
+                        )
+                        verify_input_ids = verify_kwargs.pop("input_ids")
+                        verify_kwargs["attention_mask"] = full_attention_mask
+                        verify_kwargs["position_ids"] = target.model.compute_3d_position_ids(
+                            input_ids=token_ids,
+                            image_grid_thw=None,
+                            video_grid_thw=None,
+                            inputs_embeds=target_embeddings(token_ids),
+                            attention_mask=full_attention_mask,
+                            past_key_values=past_key_values_target,
+                            mm_token_type_ids=None,
+                        )[:, :, -1:]
+                        if "cache_position" in target_forward_params:
+                            verify_kwargs["cache_position"] = torch.tensor(
+                                [start + block_index],
+                                dtype=torch.long,
+                                device=target.device,
+                            )
+                    else:
+                        verify_input_ids = token_ids
+                        verify_kwargs = {
+                            "position_ids": block_position_ids[:, block_index : block_index + 1],
+                            "past_key_values": past_key_values_target,
+                            "use_cache": True,
+                        }
+                    verify_kwargs["output_hidden_states"] = True
+                    phase_start = start_timing()
+                    with target_verify_backend():
+                        step_output = target(verify_input_ids, **verify_kwargs)
+                    end_timing("target_verify", phase_start)
+                    step_posterior = sample(step_output.logits[:, -1:], temperature)
+                    posterior_tokens.append(step_posterior)
+                    verified_hidden_states.append(
+                        extract_context_feature(step_output.hidden_states, self.target_layer_ids)
+                    )
+                    if block_index == block_output_ids.shape[1] - 1:
+                        break
+                    if block_output_ids[0, block_index + 1] != step_posterior[0, 0]:
+                        break
+                    acceptance_length += 1
+                posterior = torch.cat(posterior_tokens, dim=1)
+                verified_target_hidden = torch.cat(verified_hidden_states, dim=1)
+            elif target_is_vlm:
+                prompt_attention_mask = target_kwargs.get("attention_mask")
+                if prompt_attention_mask is None:
+                    prompt_attention_mask = torch.ones_like(input_ids)
+                full_attention_mask = torch.cat(
+                    (
+                        prompt_attention_mask,
+                        torch.ones(
+                            (1, start + block_output_ids.shape[1] - num_input_tokens),
+                            dtype=prompt_attention_mask.dtype,
+                            device=target.device,
+                        ),
+                    ),
+                    dim=1,
+                )
+                full_input_ids = torch.cat((output_ids[:, :start], block_output_ids), dim=1)
+                generation_kwargs = {
+                    key: value
+                    for key, value in target_kwargs.items()
+                    if key not in {"attention_mask", "mm_token_type_ids", "pixel_values", "pixel_values_videos"}
+                }
+                verify_kwargs = target.prepare_inputs_for_generation(
+                    full_input_ids,
+                    next_sequence_length=block_output_ids.shape[1],
+                    past_key_values=past_key_values_target,
+                    attention_mask=full_attention_mask,
+                    is_first_iteration=False,
+                    use_cache=True,
+                    **generation_kwargs,
+                )
+                verify_input_ids = verify_kwargs.pop("input_ids")
+                verify_kwargs["output_hidden_states"] = True
+                # Qwen2.5-VL uses the full mask when deriving incremental
+                # MRoPE positions. Omitting it makes the cache path fall back
+                # to plain arange positions and diverge from generate().
+                verify_kwargs["attention_mask"] = full_attention_mask
+                # ``compute_3d_position_ids`` returns positions for the full
+                # mask, while the cache path consumes only the new block.
+                # Slice the tail before passing them to the VLM.
+                verify_kwargs["position_ids"] = target.model.compute_3d_position_ids(
+                    input_ids=block_output_ids,
+                    image_grid_thw=None,
+                    video_grid_thw=None,
+                    inputs_embeds=target_embeddings(block_output_ids),
+                    attention_mask=full_attention_mask,
+                    past_key_values=past_key_values_target,
+                    mm_token_type_ids=None,
+                )[:, :, -block_output_ids.shape[1] :]
+                if "cache_position" in target_forward_params:
+                    verify_kwargs["cache_position"] = torch.arange(
+                        start,
+                        start + block_output_ids.shape[1],
+                        dtype=torch.long,
+                        device=target.device,
+                    )
+            else:
+                verify_input_ids = block_output_ids
+                verify_kwargs = {
+                    "past_key_values": past_key_values_target,
+                    "use_cache": True,
+                    "output_hidden_states": True,
+                }
+                verify_kwargs["position_ids"] = block_position_ids
+            if not sequential_target_verification:
+                phase_start = start_timing()
+                with target_verify_backend():
+                    output = target(verify_input_ids, **verify_kwargs)
+                end_timing("target_verify", phase_start)
+                posterior = sample(output.logits, temperature)
+                acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+                verified_target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+            accepted_tokens += int(acceptance_length)
+            verify_steps += 1
             output_ids[:, start : start + acceptance_length + 1] = block_output_ids[:, : acceptance_length + 1]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
             start += acceptance_length + 1
             past_key_values_target.crop(start)
-            target_hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)[
-                :, : acceptance_length + 1, :
-            ]
+            target_hidden = verified_target_hidden[:, : acceptance_length + 1, :]
             if stop_token_ids is not None and any(
                 stop_id in output_ids[:, num_input_tokens:] for stop_id in stop_token_ids
             ):
@@ -399,4 +640,18 @@ class Qwen3DFlashDraftModel(Qwen3PreTrainedModel):
             stop_indices = torch.isin(output_ids[0][num_input_tokens:], stop_ids).nonzero(as_tuple=True)[0]
             if stop_indices.numel() > 0:
                 output_ids = output_ids[:, : num_input_tokens + stop_indices[0] + 1]
-        return output_ids
+        if not return_stats:
+            return output_ids
+        timing_seconds = {f"{phase}_seconds": 0.0 for phase in timing_events}
+        if any(timing_events.values()):
+            torch.cuda.synchronize()
+            timing_seconds = {
+                f"{phase}_seconds": sum(start.elapsed_time(end) for start, end in events) / 1000.0
+                for phase, events in timing_events.items()
+            }
+        return output_ids, {
+            "draft_tokens": float(draft_tokens),
+            "accepted_tokens": float(accepted_tokens),
+            "verify_steps": float(verify_steps),
+            **timing_seconds,
+        }

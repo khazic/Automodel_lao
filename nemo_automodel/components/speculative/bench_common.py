@@ -189,6 +189,12 @@ def _load_prompts(args: argparse.Namespace) -> list[list[dict[str, Any]]]:
     """
     from nemo_automodel.components.datasets.llm.chat_dataset import _load_openai_messages
 
+    benchmark_adapter = getattr(args, "benchmark_adapter", None)
+    if benchmark_adapter:
+        from nemo_automodel.components.speculative.bench_multimodal import load_multimodal_prompts
+
+        return load_multimodal_prompts(args, _load_openai_messages)
+
     dataset = _load_openai_messages(
         args.input_data,
         split=args.split,

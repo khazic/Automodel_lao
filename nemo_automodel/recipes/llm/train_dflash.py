@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DFlash draft-model training recipe (Qwen3-style targets).
+"""DFlash draft-model training recipe for Qwen-style text and VLM targets.
 
 DFlash drafts a whole block of tokens in parallel via MASK-token denoising
 conditioned on the frozen target's hidden states (see
@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 from huggingface_hub import constants as hf_constants
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from nemo_automodel._transformers import NeMoAutoModelForCausalLM
@@ -49,6 +49,8 @@ from nemo_automodel.components.checkpoint.checkpointing import (
 from nemo_automodel.components.checkpoint.utils import find_latest_checkpoint, resolve_restore_from_to_checkpoint_dir
 from nemo_automodel.components.config._arg_parser import parse_args_and_load_config
 from nemo_automodel.components.datasets.llm.eagle3 import build_eagle3_dataloader
+from nemo_automodel.components.datasets.vlm.dspark_collate import build_dspark_vlm_dataloader
+from nemo_automodel.components.datasets.vlm.utils import set_image_pixel_bounds
 from nemo_automodel.components.distributed.init_utils import initialize_distributed
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 from nemo_automodel.components.loggers.log_utils import setup_logging
@@ -56,7 +58,7 @@ from nemo_automodel.components.loggers.wandb_utils import init_wandb_run, suppre
 from nemo_automodel.components.speculative.dflash.core import DFlashTrainerModule, NoValidAnchorsError
 from nemo_automodel.components.speculative.dflash.draft_qwen3 import build_target_layer_ids
 from nemo_automodel.components.speculative.dflash.registry import resolve_dflash_draft_spec
-from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel
+from nemo_automodel.components.speculative.dflash.target import HFDFlashTargetModel, HFMultimodalDFlashTargetModel
 from nemo_automodel.components.training.rng import StatefulRNG
 from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
 from nemo_automodel.recipes.base_recipe import BaseRecipe, _is_checkpoint_model_config_compatible
@@ -88,6 +90,52 @@ def _packing_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         "seq_lens": batch["seq_lens"],
         "doc_remaining": batch["doc_remaining"],
     }
+
+
+def _target_forward_kwargs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Return auxiliary target inputs from a text or multimodal batch.
+
+    Args:
+        batch: Mapping containing padded tensors. ``input_ids``,
+            ``attention_mask``, and ``loss_mask`` have shape [batch, sequence];
+            multimodal tensors retain their processor-defined leading axes.
+
+    Returns:
+        A mapping of packing metadata and multimodal processor tensors. Returned
+        tensors alias the input mapping's tensors.
+    """
+    core_keys = {"input_ids", "attention_mask", "loss_mask"}
+    return {name: value for name, value in batch.items() if name not in core_keys}
+
+
+def _build_draft_config(
+    target_text_config,
+    *,
+    draft_num_hidden_layers: int,
+    num_target_layers: int,
+    block_size: int,
+    dflash_config: dict,
+    attention_backend: str,
+) -> Qwen3Config:
+    """Construct the Qwen3-style DFlash config from a target text config."""
+    draft_config = target_text_config.to_dict()
+    draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
+    draft_config["num_hidden_layers"] = draft_num_hidden_layers
+    draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
+    draft_config["max_window_layers"] = draft_num_hidden_layers
+    draft_config["num_target_layers"] = num_target_layers
+    draft_config["block_size"] = block_size
+    draft_config["dflash_config"] = dflash_config
+    # Multimodal RoPE sections describe the target's image/video coordinate
+    # layout. The text-only DFlash block uses one-dimensional token positions.
+    rope_scaling = draft_config.get("rope_scaling") or draft_config.get("rope_parameters")
+    if isinstance(rope_scaling, dict) and "mrope_section" in rope_scaling:
+        rope_theta = float(rope_scaling.get("rope_theta", 10000.0))
+        draft_config.pop("rope_scaling", None)
+        draft_config["rope_parameters"] = {"rope_type": "default", "rope_theta": rope_theta}
+    config = Qwen3Config.from_dict(draft_config)
+    config._attn_implementation = attention_backend
+    return config
 
 
 def _validate_packing_gates(*, cp_size: int, target_attn_impl: str, micro_batch_size: int) -> None:
@@ -147,7 +195,9 @@ def _submesh_or_none(device_mesh, name: str):
 
 
 class TrainDFlashRecipe(BaseRecipe):
-    """Recipe for DFlash draft-model training on Qwen3-style dense / MoE targets."""
+    """Train a Qwen3-style DFlash draft from a supported frozen target."""
+
+    is_multimodal: bool = False
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -170,10 +220,22 @@ class TrainDFlashRecipe(BaseRecipe):
         )
         architectures = getattr(target_config, "architectures", []) or []
         draft_spec = resolve_dflash_draft_spec(architectures)
+        self.is_multimodal = draft_spec.is_multimodal
+        target_text_config = target_config.get_text_config() if self.is_multimodal else target_config
 
         self.tokenizer = NeMoAutoTokenizer.from_pretrained(
             target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
         )
+        self.processor = None
+        if self.is_multimodal:
+            self.processor = AutoProcessor.from_pretrained(
+                target_path, trust_remote_code=recipe_cfg.get("trust_remote_code", False)
+            )
+            set_image_pixel_bounds(
+                self.processor,
+                max_pixels=recipe_cfg.get("image_max_pixels", None),
+                min_pixels=recipe_cfg.get("image_min_pixels", None),
+            )
         self.compute_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
 
         self.target_model = self._build_target_model(recipe_cfg, target_path)
@@ -181,7 +243,7 @@ class TrainDFlashRecipe(BaseRecipe):
         # Resolve the captured target layers once and share them between the
         # target wrapper (what to capture) and the draft config (the ``fc`` input
         # width) so the two never disagree.
-        num_target_layers = int(target_config.num_hidden_layers)
+        num_target_layers = int(target_text_config.num_hidden_layers)
         draft_num_hidden_layers = int(recipe_cfg.get("draft_num_hidden_layers", 5))
         target_layer_ids = list(
             recipe_cfg.get("target_layer_ids", None)
@@ -190,7 +252,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self.target_wrapper = self._build_target_wrapper(target_layer_ids)
 
         self.block_size = int(recipe_cfg.get("block_size", 16))
-        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_config.vocab_size)
+        self.mask_token_id = self._resolve_mask_token_id(recipe_cfg, target_text_config.vocab_size)
 
         # ``packed_sequence_size > 0`` enables sequence packing; the DFlash target,
         # block mask, anchor sampling, and draft RoPE all consume the block-causal
@@ -202,56 +264,36 @@ class TrainDFlashRecipe(BaseRecipe):
                 target_attn_impl=getattr(self.target_model.config, "_attn_implementation", None) or "",
                 micro_batch_size=int(recipe_cfg.micro_batch_size),
             )
-        self.train_dataloader = build_eagle3_dataloader(
-            data_path=recipe_cfg.train_data_path,
-            tokenizer=self.tokenizer,
-            seq_length=recipe_cfg.seq_length,
-            batch_size=recipe_cfg.micro_batch_size,
-            shuffle=True,
-            num_workers=recipe_cfg.get("num_workers", 0),
-            split=recipe_cfg.get("train_split", None),
-            distributed=self.dist_env.world_size > 1,
-            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+        self.train_dataloader = self._build_dataloader(
+            recipe_cfg=recipe_cfg,
+            dataset_cfg=self.cfg.get("dataset", None),
+            train=True,
             packed_sequence_size=packed_sequence_size,
-            dp_mesh=self.dp_mesh,
         )
         self.val_dataloader = None
-        if recipe_cfg.get("val_data_path", None):
-            self.val_dataloader = build_eagle3_dataloader(
-                data_path=recipe_cfg.val_data_path,
-                tokenizer=self.tokenizer,
-                seq_length=recipe_cfg.seq_length,
-                batch_size=recipe_cfg.micro_batch_size,
-                shuffle=False,
-                num_workers=recipe_cfg.get("num_workers", 0),
-                split=recipe_cfg.get("val_split", None),
-                distributed=self.dist_env.world_size > 1,
-                shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
-                mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+        val_dataset_cfg = self.cfg.get("val_dataset", None)
+        if val_dataset_cfg is not None or recipe_cfg.get("val_data_path", None):
+            self.val_dataloader = self._build_dataloader(
+                recipe_cfg=recipe_cfg,
+                dataset_cfg=val_dataset_cfg,
+                train=False,
                 packed_sequence_size=packed_sequence_size,
-                dp_mesh=self.dp_mesh,
             )
 
         # DFlash draft config: a small non-causal Qwen3 stack that reuses the
         # target's architecture defaults (head_dim, rope_theta, rms_norm_eps, ...).
-        draft_config = target_config.to_dict()
-        draft_config["architectures"] = ["Qwen3DFlashDraftModel"]
-        draft_config["num_hidden_layers"] = draft_num_hidden_layers
-        # ``layer_types``/``max_window_layers`` are sized to the target's depth;
-        # rebuild them for the (shallower) draft. The DFlash attention never uses
-        # sliding windows, so every draft layer is full attention.
-        draft_config["layer_types"] = ["full_attention"] * draft_num_hidden_layers
-        draft_config["max_window_layers"] = draft_num_hidden_layers
-        draft_config["num_target_layers"] = num_target_layers
-        draft_config["block_size"] = self.block_size
-        draft_config["dflash_config"] = self._build_dflash_config(recipe_cfg, target_layer_ids)
         # A single knob drives both the trainer's mask format and the draft's
         # attention function -- they must agree (a flex BlockMask only works with
         # the flex attention fn, a dense bool mask only with sdpa/eager).
         attention_backend = recipe_cfg.get("attention_backend", "flex_attention")
-        draft_config_obj = Qwen3Config.from_dict(draft_config)
-        draft_config_obj._attn_implementation = attention_backend
+        draft_config_obj = _build_draft_config(
+            target_text_config,
+            draft_num_hidden_layers=draft_num_hidden_layers,
+            num_target_layers=num_target_layers,
+            block_size=self.block_size,
+            dflash_config=self._build_dflash_config(recipe_cfg, target_layer_ids),
+            attention_backend=attention_backend,
+        )
         self.draft_model = draft_spec.draft_cls(draft_config_obj).to(device=self.device, dtype=self.compute_dtype)
         # Optional FP8 draft compute, in place (see apply_draft_fp8); must precede the DDP wrap.
         apply_draft_fp8(self.draft_model, self.cfg.get("fp8", None))
@@ -311,6 +353,8 @@ class TrainDFlashRecipe(BaseRecipe):
         self.total_optim_steps = total_optim_steps
         self.runtime = SimpleNamespace(global_step=0)
         self._resume_epoch = 0
+        self._resume_batch_idx = 0
+        self._next_batch_idx = 0
         self._skipped_micro_batches = 0
 
         # Seed by the dp coordinate, not the global rank: the draft is replicated
@@ -329,6 +373,41 @@ class TrainDFlashRecipe(BaseRecipe):
                 self.cfg.to_dict(),
                 default_name=type(self).__name__.lower() + "_" + str(target_path).rstrip("/").split("/")[-1],
             )
+
+    def _build_dataloader(self, *, recipe_cfg, dataset_cfg, train: bool, packed_sequence_size: int):
+        """Build the text or multimodal DFlash dataloader."""
+        if self.is_multimodal:
+            if packed_sequence_size > 0:
+                raise ValueError("Multimodal DFlash does not support packed_sequence_size > 0.")
+            if dataset_cfg is None:
+                split_name = "dataset" if train else "val_dataset"
+                raise ValueError(f"Multimodal DFlash requires a {split_name}: config block.")
+            return build_dspark_vlm_dataloader(
+                dataset_cfg=dataset_cfg,
+                processor=self.processor,
+                batch_size=int(recipe_cfg.micro_batch_size),
+                max_length=int(recipe_cfg.seq_length),
+                shuffle=train,
+                num_workers=int(recipe_cfg.get("num_workers", 0)),
+                distributed=self.dist_env.world_size > 1,
+                dp_mesh=self.dp_mesh,
+                inject_fake_image=False,
+            )
+        data_path = recipe_cfg.train_data_path if train else recipe_cfg.val_data_path
+        return build_eagle3_dataloader(
+            data_path=data_path,
+            tokenizer=self.tokenizer,
+            seq_length=recipe_cfg.seq_length,
+            batch_size=recipe_cfg.micro_batch_size,
+            shuffle=train,
+            num_workers=recipe_cfg.get("num_workers", 0),
+            split=recipe_cfg.get("train_split" if train else "val_split", None),
+            distributed=self.dist_env.world_size > 1,
+            shuffle_seed=recipe_cfg.get("shuffle_seed", 42),
+            mask_reasoning_content=recipe_cfg.get("mask_reasoning_content", False),
+            packed_sequence_size=packed_sequence_size,
+            dp_mesh=self.dp_mesh,
+        )
 
     def _build_target_model(self, recipe_cfg, target_path: str) -> torch.nn.Module:
         """Load the frozen (optionally tensor-parallel) target model.
@@ -389,8 +468,17 @@ class TrainDFlashRecipe(BaseRecipe):
                         "any other backend (e.g. flash_attention_2) bypasses the K/V-gather hook, so each rank "
                         "silently attends only its own shard."
                     )
-        target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
-        if self.dist_setup is None:
+        if self.is_multimodal:
+            if self.dist_setup is not None and int(self.cfg.get("distributed.tp_size", 1) or 1) > 1:
+                raise NotImplementedError("Multimodal DFlash does not support tensor-parallel target loading yet.")
+            if self.cp_mesh is not None and self.cp_mesh.size() > 1:
+                raise NotImplementedError("Multimodal DFlash does not support context-parallel target loading yet.")
+            target_kwargs.pop("force_hf", None)
+            target_kwargs.pop("distributed_setup", None)
+            target_model = AutoModelForImageTextToText.from_pretrained(target_path, **target_kwargs)
+        else:
+            target_model = NeMoAutoModelForCausalLM.from_pretrained(target_path, **target_kwargs)
+        if self.dist_setup is None or self.is_multimodal:
             # ``nn.Module.to`` is in-place; the sharded path is already placed by
             # ``from_pretrained``.
             target_model.to(self.device)
@@ -416,9 +504,8 @@ class TrainDFlashRecipe(BaseRecipe):
         Subclasses override to capture extra teacher signals (e.g. JetSpec also
         captures the target logits for its forward-KL distillation).
         """
-        return HFDFlashTargetModel(
-            self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None)
-        )
+        wrapper_cls = HFMultimodalDFlashTargetModel if self.is_multimodal else HFDFlashTargetModel
+        return wrapper_cls(self.target_model, target_layer_ids=target_layer_ids, cp_mesh=getattr(self, "cp_mesh", None))
 
     def _build_dflash_config(self, recipe_cfg, target_layer_ids: list[int]) -> dict:
         """Build the draft ``dflash_config`` block. Subclasses extend it (e.g. Domino)."""
@@ -653,11 +740,12 @@ class TrainDFlashRecipe(BaseRecipe):
                 dist.barrier()
 
     def _save_extra_state(self, path: str, epoch: int) -> None:
-        """Persist DFlash meta: global_step, epoch, block_size, and target layers."""
+        """Persist DFlash progress and model metadata."""
         torch.save(
             {
                 "global_step": self.runtime.global_step,
                 "epoch": int(epoch),
+                "next_batch_idx": int(getattr(self, "_next_batch_idx", 0)),
                 "block_size": self.block_size,
                 "mask_token_id": self.mask_token_id,
                 "target_layer_ids": list(self.target_wrapper.target_layer_ids),
@@ -708,7 +796,7 @@ class TrainDFlashRecipe(BaseRecipe):
         self._load_extra_state(ckpt_dir)
 
     def _load_extra_state(self, ckpt_dir: str) -> None:
-        """Restore DFlash meta: global_step and epoch, and validate mask_token_id."""
+        """Restore DFlash progress metadata and validate ``mask_token_id``."""
         meta_path = os.path.join(ckpt_dir, "dflash_meta.pt")
         if os.path.exists(meta_path):
             meta = load_torch_ckpt(
@@ -718,6 +806,13 @@ class TrainDFlashRecipe(BaseRecipe):
             )
             self.runtime.global_step = int(meta.get("global_step", 0))
             self._resume_epoch = int(meta.get("epoch", 0))
+            self._resume_batch_idx = int(meta.get("next_batch_idx", 0))
+            if "next_batch_idx" not in meta and self.runtime.global_step > 0:
+                logger.warning(
+                    "Checkpoint %s predates exact mid-epoch resume metadata; restarting epoch %d at batch 0.",
+                    ckpt_dir,
+                    self._resume_epoch,
+                )
             # ``mask_token_id`` comes only from the resume YAML (it is not
             # restored from the checkpoint); the draft's ``embed_tokens`` row at
             # that id is the learned "predict here" signal and the inference
@@ -791,7 +886,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     loss_mask=batch["loss_mask"],
-                    **_packing_kwargs(batch),
+                    **_target_forward_kwargs(batch),
                 )
                 try:
                     # Route through the same seam as training so subclass-specific
@@ -835,6 +930,7 @@ class TrainDFlashRecipe(BaseRecipe):
         """Run the DFlash training loop."""
         self.trainer_module.train()
         start_epoch = max(0, int(getattr(self, "_resume_epoch", 0)))
+        start_batch_idx = max(0, int(getattr(self, "_resume_batch_idx", 0)))
         if start_epoch >= self.num_epochs:
             if self.dist_env.is_main:
                 logger.info("All %d epochs already completed; nothing to do.", self.num_epochs)
@@ -856,15 +952,27 @@ class TrainDFlashRecipe(BaseRecipe):
                 completed_steps = 0
                 last_batch_idx = -1
                 num_batches = len(self.train_dataloader)
+                resume_batch_idx = start_batch_idx if epoch_idx == start_epoch else 0
+                if resume_batch_idx > num_batches:
+                    raise ValueError(
+                        f"Checkpoint next_batch_idx={resume_batch_idx} exceeds dataloader length {num_batches} "
+                        f"for epoch {epoch_idx}."
+                    )
+                self._next_batch_idx = resume_batch_idx
+                if resume_batch_idx and self.dist_env.is_main:
+                    logger.info("Resuming epoch %d at dataloader batch %d", epoch_idx, resume_batch_idx)
                 is_ddp = isinstance(self.trainer_module, DistributedDataParallel)
                 for batch_idx, batch in enumerate(self.train_dataloader):
+                    if batch_idx < resume_batch_idx:
+                        continue
                     last_batch_idx = batch_idx
+                    self._next_batch_idx = batch_idx + 1
                     batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
                     target_batch = self.target_wrapper.generate_batch(
                         input_ids=batch["input_ids"],
                         attention_mask=batch["attention_mask"],
                         loss_mask=batch["loss_mask"],
-                        **_packing_kwargs(batch),
+                        **_target_forward_kwargs(batch),
                     )
                     sync_grads = should_sync_grads(
                         pending_micro_batches=pending_micro_batches,
@@ -982,6 +1090,7 @@ class TrainDFlashRecipe(BaseRecipe):
                     self._maybe_save_step_checkpoint(epoch_idx)
 
                 eval_metrics = self._run_eval()
+                self._next_batch_idx = 0
                 if self.dist_env.is_main:
                     msg = (
                         f"Finished epoch {epoch_idx + 1}/{self.num_epochs} completed_steps={completed_steps} "
