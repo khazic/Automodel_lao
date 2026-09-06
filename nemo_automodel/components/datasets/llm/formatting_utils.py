@@ -195,9 +195,6 @@ def _build_multiturn_assistant_mask(
             seq_length=seq_length,
         )
     length_cache: Dict[int, int] = {len(formatted_text): len(unpadded_full_ids)}
-    if prefix_cache is not None:
-        prefix_cache.setdefault(len(formatted_text), unpadded_full_ids)
-        length_cache.update((k, len(ids)) for k, ids in prefix_cache.items())
 
     def prefix_length(k: int) -> int:
         if k not in length_cache:
@@ -270,108 +267,6 @@ def _truncation_window_offset(
         f"Cannot mask {what} after truncation because the retained tokens are not a contiguous "
         "prefix or suffix of the untruncated conversation render."
     )
-
-
-_SENTINEL_TEXTS = ("", "0", "1")
-"""Replacement texts for :func:`_generation_prefix_bound`. The empty text renders the turn
-with no generated text at all, which is what fixes the content boundary; the two others are
-compared token by token, so what matters is that they tokenize differently, not how they read."""
-
-
-def _perturbed_assistant_message(message: dict[str, Any], sentinel: str) -> dict[str, Any]:
-    """Return a copy of an assistant message whose model-generated text is replaced by ``sentinel``.
-
-    Every field the model would produce is swapped: ``content`` (string or text
-    parts) and any reasoning field. ``tool_calls`` are dropped rather than
-    rewritten, because their serialization starts with boilerplate
-    (``{"name": "``) the model nevertheless generates; dropping them makes the
-    render diverge at the call marker instead.
-    """
-    perturbed = {k: v for k, v in message.items() if k != "tool_calls"}
-    content = message.get("content")
-    if isinstance(content, list):
-        perturbed["content"] = [
-            {**part, "text": sentinel} if isinstance(part, dict) and "text" in part else part for part in content
-        ]
-    else:
-        perturbed["content"] = sentinel
-    for key in ("reasoning_content", "reasoning"):
-        if message.get(key):
-            perturbed[key] = sentinel
-    return perturbed
-
-
-def _generation_prefix_bound(
-    tokenizer: "PreTrainedTokenizer",
-    prefix: list[dict[str, Any]],
-    message: dict[str, Any],
-    conversation_ids: list[int],
-    turn: list[int],
-    **render_kwargs: Any,
-) -> int:
-    """Return how many leading tokens of ``turn`` provably do not depend on ``message``.
-
-    The turn is rendered again with its generated text swapped for each of
-    :data:`_SENTINEL_TEXTS`, and only tokens every render shares with the real
-    turn, at the same position, may be masked as the generation prompt. The
-    content boundary comes from the render with the generated text removed
-    entirely: whatever the template emits before the first token that render
-    lacks is present with no message text at all, so it cannot be owned by the
-    content. That render alone is not enough, because a template's closing
-    token can coincide with the real text's first token, so two non-empty
-    sentinels must also agree up to the bound and diverge from each other
-    afterwards; checking token ids rather than characters keeps normalization
-    or an UNK mapping from folding a sentinel onto the real text. A prefix
-    token the tokenizer emits for every non-empty value (a word-start marker,
-    say) is absent from the empty render and therefore never masked. When the
-    non-empty sentinel renders do not diverge, or any render already differs
-    inside the conversation prefix, nothing is proven and the bound is ``0``
-    (nothing is masked).
-
-    Removing the text can also merge the template's own characters into one
-    token: Qwen3-Thinking renders a reasoning turn as ``<think>\\n`` + text,
-    and with no text the ``\\n`` fuses with the ``\\n</think>`` that follows
-    into a single ``\\n\\n`` token, so the empty render diverges from the real
-    turn one token before the text starts. The bound stops there and that
-    ``\\n`` keeps its supervision. Extending it would need a proof on the
-    rendered text that the real token lies inside the template's characters;
-    a prefix relation between tokenizer-internal token strings is not one
-    (byte-level tokens can share an internal prefix while their decoded text
-    differs), so the comparison is on token ids only and fails closed.
-
-    Token ids alone also cannot tell a template's closing token from a
-    content token that maps to the same id (through normalization or an UNK
-    mapping): with a header-less turn whose closing ``<eot>`` and content
-    marker ``<word_start>`` share an id, the empty render ``[X]`` is a prefix
-    of the real turn ``[X, text..., X]`` although its only token is the
-    closing. The empty render is therefore also aligned from its end: it is
-    ``template prefix + closing`` and each sentinel render is ``template
-    prefix + text + closing``, so their common suffix is at least the
-    closing, and no token inside it may be masked. Everything a token could
-    be is excluded; the two alignments never overlap.
-    """
-    tails: list[list[int]] = []
-    for sentinel in _SENTINEL_TEXTS:
-        ids = _tokenize_chat(tokenizer, prefix + [_perturbed_assistant_message(message, sentinel)], **render_kwargs)
-        if ids[: len(conversation_ids)] != conversation_ids:
-            return 0
-        tails.append(ids[len(conversation_ids) :])
-    empty, sentinels = tails[0], tails[1:]
-    if sentinels[0] == sentinels[1]:
-        return 0
-    bound = min(_common_prefix_length(tail, turn) for tail in sentinels)
-    bound = min(bound, _common_prefix_length(*sentinels))
-    bound = min(bound, _common_prefix_length(empty, turn))
-    closing = max(_common_suffix_length(empty, tail) for tail in sentinels)
-    return max(0, min(bound, len(empty) - closing))
-
-
-def _common_suffix_length(left: list[int], right: list[int]) -> int:
-    """Return the number of trailing elements ``left`` and ``right`` share."""
-    n = 0
-    while n < min(len(left), len(right)) and left[-(n + 1)] == right[-(n + 1)]:
-        n += 1
-    return n
 
 
 def _common_prefix_length(left: list[int], right: list[int]) -> int:
@@ -483,42 +378,23 @@ def _build_reasoning_mask(
 _warned_generation_prompt: set[str] = set()
 
 
-def _match_generation_prompt(block: list[int], turn: list[int], eos_token_id: int | None) -> tuple[int, bool]:
-    """Match the tokens a generation prompt adds against the start of a rendered turn.
+def _appended_generation_prompt_length(base_ids: list[int], generation_ids: list[int], turn: list[int]) -> int:
+    """Return how many leading tokens of ``turn`` a generation prompt render supplies, or ``0``.
 
-    Returns ``(matched, complete)``: how many leading tokens of ``turn`` the
-    prompt reproduces, and whether the whole prompt was reproduced. Two anchors
-    are tried and the better one (complete first, then longer) wins:
-
-    - the prompt's own first token, when it equals ``turn[0]``;
-    - the last place ``turn[0]`` occurs inside the prompt. A template appends
-      its generation prompt at the very end of the render, so whatever precedes
-      that occurrence (the ``/nothink`` GLM appends to the user turn, a rewritten
-      system block) belongs to the conversation prefix, not to the prompt. This
-      anchor is skipped when its remainder contains ``eos_token_id``: a
-      generation prompt never closes a turn, so that occurrence is rendered
-      history and should not outscore the prompt's own header.
-
-    This is a scoring rule, not the safety net: templates close turns with
-    tokens other than ``eos_token_id`` and continuation turns have no header,
-    so a wrong anchor can still reproduce real content here. The caller caps
-    the result at the turn's message-independent prefix (see
-    :func:`_build_generation_prompt_mask`), which is what keeps content out.
+    ``base_ids`` is the conversation prefix rendered plain, ``generation_ids``
+    the same prefix rendered with ``add_generation_prompt=True`` and ``turn``
+    the tokens the full render has after ``base_ids``. The prompt counts only
+    when the prompt render is the plain render plus an appended block and the
+    turn opens with that whole block: the block is then exactly what the
+    template emits at inference with no assistant message present, so it holds
+    no token of the message. A prompt render that rewrites the prefix, or a
+    turn that reproduces the block only partly, proves nothing and gives ``0``
+    (see :func:`_build_generation_prompt_mask` for why).
     """
-    if not block or not turn:
-        return 0, False
-    candidates = []
-    if block[0] == turn[0]:
-        candidates.append(0)
-    anchor = next((i for i in reversed(range(1, len(block))) if block[i] == turn[0]), None)
-    if anchor is not None and (eos_token_id is None or eos_token_id not in block[anchor:]):
-        candidates.append(anchor)
-    best = (False, 0)
-    for anchor in candidates:
-        suffix = block[anchor:]
-        matched = _common_prefix_length(suffix, turn)
-        best = max(best, (matched == len(suffix), matched))
-    return best[1], best[0]
+    if not _is_consistent_render_prefix(base_ids, generation_ids):
+        return 0
+    block = generation_ids[len(base_ids) :]
+    return len(block) if block and turn[: len(block)] == block else 0
 
 
 def _build_generation_prompt_mask(
@@ -543,40 +419,44 @@ def _build_generation_prompt_mask(
     only teaches template boilerplate, and an empty reasoning block also
     teaches an immediate ``<think>`` -> ``</think>`` transition.
 
-    The span is located without knowing any tag string. For every assistant
-    turn, ``messages[:idx]`` is rendered with ``add_generation_prompt=True`` in
-    both thinking modes (``enable_thinking`` True and False), and the tokens
-    each prompt adds are matched against the start of the turn in the full
-    render (see :func:`_match_generation_prompt`). The mode whose prompt
-    reproduces the turn best wins (a complete match first, then the longer
-    one), because the data alone cannot tell the modes apart: a thinking turn
-    may carry its reasoning in ``reasoning_content`` or inline in ``content``,
-    and a template may or may not honor ``enable_thinking`` at all.
+    The span is located without knowing any tag string, from what a generation
+    prompt is by definition: the tokens ``add_generation_prompt=True`` appends
+    to the rendered conversation prefix. For every assistant turn,
+    ``messages[:idx]`` is rendered plain and with the generation prompt; when
+    the template reads ``enable_thinking``, the prompt is rendered in both
+    modes (True and False), because the data alone cannot tell them apart: a
+    thinking turn may carry its reasoning in ``reasoning_content`` or inline
+    in ``content``. A template that never reads the variable renders one
+    prompt, without the keyword (a backend without Jinja templates may reject
+    it). A mode counts only when its prompt render appends a block to the
+    unchanged plain render and the turn in the full render opens with that
+    whole block (see :func:`_appended_generation_prompt_length`); the longest
+    such block is marked. No token of the message is compared or inferred, so
+    assistant content is never reached, and everything else fails closed:
 
-    The match alone cannot prove it stopped short of the model's own text: a
-    template may rewrite history when it renders the generation prompt (Gemma
-    prepends a thinking system block, GLM appends ``/nothink``), and a turn
-    that continues a previous one (after a tool response) has no header, so
-    the prompt's added tokens can contain earlier turns whose text repeats the
-    current one. Every anchor is therefore capped by a structural bound
-    (:func:`_generation_prefix_bound`): the turn is rendered again with its
-    generated text removed and with it replaced by two different sentinels, and
-    only tokens every render shares, the part of the turn that provably does
-    not depend on the message, may be marked. The empty render fixes the
-    content boundary (a token the tokenizer emits for any value is absent from
-    it), the check is on token ids, so a tokenizer that normalizes a sentinel
-    onto the real text's first token cannot widen it, and it fails closed
-    (marks nothing) when the sentinel renders do not diverge. Assistant content
-    can never be reached, whichever anchor won.
+    - a plain prefix render that is not an exact prefix of the full render
+      (the template rewrites history as the conversation grows, or replaces
+      its terminator) leaves the turn supervised, warned once per process;
+    - a prompt render that rewrites the prefix instead of appending to it
+      (Gemma 4 prepends a thinking system block, GLM 4.5 appends ``/nothink``
+      to the user turn) is ignored, since its added tokens cannot be told
+      from rendered history;
+    - a turn that reproduces the appended block only partly (SmolLM3, or
+      Qwen3-Thinking without reasoning text, render fewer tokens than the
+      prompt emits) is left supervised. A partial match says nothing about
+      where the template stops and the message starts, because a message
+      token can equal the prompt token at the same position: Gemma 4's
+      ``<|channel>thought\\n`` is generated in thinking mode but appended by
+      the non-thinking prompt.
 
     Truncation is handled like :func:`_build_reasoning_mask`: spans are located
     in the untruncated render and mapped back through the retained window,
-    which must be a contiguous prefix or suffix of it. A turn whose prefix
-    render cannot be aligned with the full render is left untouched (warned
-    once per process), as is a leading assistant turn whose template cannot
-    render an empty conversation; any other render error propagates. Positions are computed from unpadded
-    (left-aligned) ids, like :func:`_build_multiturn_assistant_mask`, whose
-    prefix renders are reused through ``prefix_cache``. Up to five extra
+    which must be a contiguous prefix or suffix of it. A leading assistant turn
+    whose template cannot render an empty conversation is left untouched
+    (warned once per process); any other render error propagates. Positions
+    are computed from unpadded (left-aligned) ids, like
+    :func:`_build_multiturn_assistant_mask`, whose prefix renders are read
+    from ``prefix_cache`` (nothing is written back). One or two extra
     ``apply_chat_template`` renders per assistant turn are the price, which is
     why this is opt-in.
     """
@@ -609,7 +489,12 @@ def _build_generation_prompt_mask(
         render_kwargs = dict(tools=tools, truncation=False, seq_length=None)
         # The shared cache holds truncated prefix renders; this builder needs untruncated ones.
         prefix_cache = {}
-    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    # enable_thinking is a template variable: a template that never reads it renders the same
+    # prompt in both modes, and a backend without Jinja templates may reject the keyword.
+    template = getattr(tokenizer, "chat_template", None)
+    template_text = " ".join(template.values()) if isinstance(template, dict) else str(template or "")
+    prompt_modes = [{"enable_thinking": mode} for mode in (True, False)] if "enable_thinking" in template_text else [{}]
 
     def skip(reason: str, idx: int) -> None:
         if reason not in _warned_generation_prompt:
@@ -626,49 +511,29 @@ def _build_generation_prompt_mask(
             continue
 
         prefix = formatted_text[:idx]
-        base_ids = prefix_cache.get(idx)
-        if base_ids is None and idx == 0:
+        try:
+            base_ids = prefix_cache.get(idx)
+            if base_ids is None:
+                base_ids = _tokenize_chat(tokenizer, prefix, **render_kwargs)
+            if not _is_consistent_render_prefix(base_ids, reference_full_ids):
+                skip("align the generation prompt", idx)
+                continue
+            prompt_renders = [
+                _tokenize_chat(tokenizer, prefix, add_generation_prompt=True, **mode, **render_kwargs)
+                for mode in prompt_modes
+            ]
+        except Exception:
+            if idx:
+                raise
             # A leading assistant turn has an empty prefix, which templates that read
             # messages[0] cannot render (with or without the generation prompt).
-            try:
-                base_ids = _tokenize_chat(tokenizer, prefix, **render_kwargs)
-                _tokenize_chat(tokenizer, prefix, add_generation_prompt=True, **render_kwargs)
-            except Exception:
-                skip("render the generation prompt of a leading assistant turn", idx)
-                continue
-        if base_ids is None:
-            base_ids = _tokenize_chat(tokenizer, prefix, **render_kwargs)
-        if not _is_consistent_render_prefix(base_ids, reference_full_ids, trailing_token_id=eos_token_id):
-            skip("align the generation prompt", idx)
+            skip("render the generation prompt of a leading assistant turn", idx)
             continue
-        prefix_cache[idx] = base_ids  # validated, so the multiturn builder may reuse it
-        # len(base_ids), or one less when the prefix render ends on a trailing
-        # terminator that the full render replaces.
-        start = _common_prefix_length(base_ids, reference_full_ids)
-        turn = reference_full_ids[start:]
+        turn = reference_full_ids[len(base_ids) :]
+        matched = max(_appended_generation_prompt_length(base_ids, ids, turn) for ids in prompt_renders)
 
-        best = (False, 0)
-        previous_ids: list[int] | None = None
-        for enable_thinking in (True, False):
-            generation_ids = _tokenize_chat(
-                tokenizer, prefix, add_generation_prompt=True, enable_thinking=enable_thinking, **render_kwargs
-            )
-            if generation_ids == previous_ids:  # the template ignores enable_thinking
-                continue
-            previous_ids = generation_ids
-            # Everything the generation prompt adds to (or changes in) the plain prefix render.
-            block = generation_ids[_common_prefix_length(base_ids, generation_ids) :]
-            matched, complete = _match_generation_prompt(block, turn, eos_token_id)
-            best = max(best, (complete, matched))
-        if best[1] == 0:
-            continue
-
-        # The tokens of the turn that provably do not depend on the message, i.e. the
-        # template's own prefix: no anchor may mark anything past them.
-        bound = _generation_prefix_bound(tokenizer, prefix, message, reference_full_ids[:start], turn, **render_kwargs)
-
-        first = start - reference_offset
-        for pos in range(max(first, 0), min(first + min(best[1], bound), len(generation_prompt_mask))):
+        first = len(base_ids) - reference_offset
+        for pos in range(max(first, 0), min(first + matched, len(generation_prompt_mask))):
             generation_prompt_mask[pos] = 1
 
     return generation_prompt_mask

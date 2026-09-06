@@ -435,7 +435,9 @@ class ChatDataset(Dataset):
                 template-inserted empty reasoning block (for example the ``<think></think>`` Nemotron
                 templates emit for non-thinking turns). The model never generates those tokens, so
                 supervising them only reinforces template boilerplate. Detected per template by rendering
-                the generation prompt, so no tag strings are hardcoded.
+                the generation prompt, so no tag strings are hardcoded. Only a generation prompt the
+                template appends to the unchanged conversation prefix, and that the rendered turn
+                reproduces in full, is removed; anything else leaves the turn supervised.
         """
         if tokenizer is None:
             raise ValueError("Tokenizer is required")

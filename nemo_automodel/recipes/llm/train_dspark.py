@@ -952,7 +952,7 @@ class TrainDSparkRecipe(BaseRecipe):
                 },
                 cache_name="DSpark",
                 cache_dir=self.cached_target_path,
-                producer_name="precompute_dspark",
+                producer_name="precompute_dspark (or precompute_dspark_dist)",
             )
             embed_src, head_src = read_target_weight_modules(self.cached_target_path)
             self.train_dataloader = build_cached_dspark_dataloader(

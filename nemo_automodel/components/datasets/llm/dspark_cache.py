@@ -139,7 +139,7 @@ _IDENTITY_EXEMPT_FIELDS = ("format_version", "complete")
 # Manifest fields added after the first release, with the value a producer that
 # predates them effectively used; ``read_manifest`` fills them in so older
 # caches compare and train as if they recorded it.
-MANIFEST_DEFAULTS: dict[str, Any] = {"mask_generation_prompt": False}
+MANIFEST_DEFAULTS: dict[str, Any] = {"mask_reasoning_content": False, "mask_generation_prompt": False}
 
 
 def manifest_mismatch_fields(recorded: dict[str, Any], manifest: dict[str, Any]) -> list[str]:

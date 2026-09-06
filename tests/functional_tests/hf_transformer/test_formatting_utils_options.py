@@ -214,8 +214,7 @@ def test_format_chat_template_mask_generation_prompt_real_tokenizer():
 
     eos_token_id = getattr(tok, "eos_token_id", 0)
     pad_token_id = _add_pad_token(tok) or eos_token_id
-    # An answer that starts with a digit: the structural bound swaps generated text for the
-    # digits "0" and "1", so this is the case a character-level sentinel would get wrong.
+    # An answer that starts with a digit, right after the generation prompt.
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": "How many legs does a spider have?"},

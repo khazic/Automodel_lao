@@ -251,11 +251,13 @@ The loss-mask options live under `recipe_args` in the speculative recipes (not u
 `dataset:` block): `mask_reasoning_content` drops rendered reasoning traces from the loss, and
 `mask_generation_prompt` drops the prefix of each assistant turn that the chat template's
 generation prompt supplies at inference (the role header and any empty reasoning block such as the
-`<think>\n\n</think>\n\n` Qwen3 inserts). Both default to `false`. The offline cache stores the
-loss mask, so a cache is tied to the options it was produced with: the producer takes the same two
-flags, records them in the manifest, and the cached trainer refuses to start when the recipe
-setting differs from the manifest. To train with `mask_generation_prompt` on a cache, pass the
-flag at both ends.
+`<think>\n\n</think>\n\n` Qwen3 inserts). Only a generation prompt the template appends to the
+unchanged conversation prefix, and that the rendered turn reproduces in full, is removed; anything
+else leaves the turn supervised. Both default to `false`. The offline cache stores the loss mask,
+so a cache is tied to the options it was produced with: the producer takes the same two flags,
+records them in the manifest, and the cached trainer refuses to start when the recipe setting
+differs from the manifest. To train with `mask_generation_prompt` on a cache, pass the flag at
+both ends.
 
 Both options locate assistant turns by rendering conversation prefixes, like answer-only
 masking on a template without `{% generation %}` blocks, so they need a template that renders

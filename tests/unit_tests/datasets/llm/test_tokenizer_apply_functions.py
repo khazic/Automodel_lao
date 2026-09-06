@@ -31,11 +31,10 @@ import pytest
 
 from nemo_automodel.components.datasets.llm.formatting_utils import (
     _add_pad_token,
+    _appended_generation_prompt_length,
     _build_generation_prompt_mask,
-    _match_generation_prompt,
     _package_tokenized_example,
     _pad_to_seq_length,
-    _perturbed_assistant_message,
     _tokenize_chat,
     _warned_add_pad_token,
     _warned_generation_prompt,
@@ -1383,7 +1382,7 @@ class _StubTokenizerChatNoGenThinkingPromptOnlyBlock(_StubTokenizerChatNoGen):
     but the ``enable_thinking=False`` generation prompt ends with an empty one (and also
     rewrites the system block, so its added tokens start before the assistant header)."""
 
-    chat_template = "<dummy prompt-only think block template>"
+    chat_template = "<dummy prompt-only think block enable_thinking template>"
 
     def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
         ids: List[int] = [self._start_of_turn_token_id]
@@ -1443,6 +1442,13 @@ _NO_REASONING = [
 ]
 
 
+def _decode(tok, sample):
+    inv = {v: k for k, v in tok._vocab.items()}
+    inv[tok.eos_token_id] = "<eos>"
+    inv[tok._start_of_turn_token_id] = "<sot>"
+    return [inv[i] for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
+
+
 def test_mask_generation_prompt_masks_template_inserted_empty_think_block():
     tok = _StubTokenizerChatNoGenThinking()
 
@@ -1451,17 +1457,10 @@ def test_mask_generation_prompt_masks_template_inserted_empty_think_block():
 
     # Same tokens either way; only the loss mask differs.
     assert masked["input_ids"] == default["input_ids"]
-
-    def supervised(sample):
-        inv = {v: k for k, v in tok._vocab.items()}
-        inv[tok.eos_token_id] = "<eos>"
-        inv[tok._start_of_turn_token_id] = "<sot>"
-        return [inv[i] for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
-
     # Without the flag the empty think block (and the header) are supervised: the bug.
-    assert supervised(default) == ["<assistant>", "<think>", "</think>", "final", "answer", "<eos>"]
+    assert _decode(tok, default) == ["<assistant>", "<think>", "</think>", "final", "answer", "<eos>"]
     # With the flag only what the model actually generates at inference remains.
-    assert supervised(masked) == ["final", "answer", "<eos>"]
+    assert _decode(tok, masked) == ["final", "answer", "<eos>"]
 
 
 def test_mask_generation_prompt_uses_thinking_prompt_for_reasoning_turns():
@@ -1472,13 +1471,9 @@ def test_mask_generation_prompt_uses_thinking_prompt_for_reasoning_turns():
     ]
 
     sample = _format(tok, messages, mask_generation_prompt=True, mask_reasoning_content=True)
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    supervised = [inv.get(i, "<sot>") for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
-
     # The thinking generation prompt is ``<assistant> <think>``; the reasoning text is
     # removed by mask_reasoning_content; the model still has to produce ``</think>``.
-    assert supervised == ["</think>", "final", "answer", "<eos>"]
+    assert _decode(tok, sample) == ["</think>", "final", "answer", "<eos>"]
 
 
 def test_mask_generation_prompt_multiturn_and_last_turn_only():
@@ -1489,17 +1484,11 @@ def test_mask_generation_prompt_multiturn_and_last_turn_only():
         {"role": "user", "content": "q2"},
         {"role": "assistant", "content": "beta"},
     ]
-    inv_ids = lambda sample: [  # noqa: E731
-        {v: k for k, v in tok._vocab.items()}.get(i, "<eos>" if i == tok.eos_token_id else "<sot>")
-        for i, keep in zip(sample["input_ids"], sample["loss_mask"])
-        if keep
-    ]
-
     both = _format(tok, messages, mask_generation_prompt=True)
-    assert inv_ids(both) == ["alpha", "<eos>", "beta", "<eos>"]
+    assert _decode(tok, both) == ["alpha", "<eos>", "beta", "<eos>"]
 
     last = _format(tok, messages, mask_generation_prompt=True, train_on_last_turn_only=True)
-    assert inv_ids(last) == ["beta", "<eos>"]
+    assert _decode(tok, last) == ["beta", "<eos>"]
 
 
 def test_mask_generation_prompt_with_generation_kwd_template():
@@ -1507,68 +1496,55 @@ def test_mask_generation_prompt_with_generation_kwd_template():
 
     default = _format(tok, _NO_REASONING)
     masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-
-    def supervised(sample):
-        return [inv[i] for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
-
     # The template's own assistant mask already excludes the header but keeps the tags.
-    assert supervised(default) == ["<think>", "</think>", "final", "answer", "<eos>"]
-    assert supervised(masked) == ["final", "answer", "<eos>"]
+    assert _decode(tok, default) == ["<think>", "</think>", "final", "answer", "<eos>"]
+    assert _decode(tok, masked) == ["final", "answer", "<eos>"]
 
 
-def test_mask_generation_prompt_tolerates_trailing_eos_in_prefix_render():
+def test_mask_generation_prompt_fails_closed_when_prefix_render_ends_with_trailing_eos():
+    # The prefix render ends on an EOS that the full render replaces. Answer-only masking
+    # tolerates that terminator, the generation prompt does not: a prompt that replaces the
+    # prefix's terminator is not a block appended to the prefix, so the turn keeps every
+    # token supervised, empty think block included.
     tok = _StubTokenizerChatNoGenThinking()
     tok.trailing_eos = True
 
+    default = _format(tok, _NO_REASONING)
     masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    inv[tok._start_of_turn_token_id] = "<sot>"
-    supervised = [inv[i] for i, keep in zip(masked["input_ids"], masked["loss_mask"]) if keep]
-
-    assert "<think>" not in supervised and "</think>" not in supervised
-    assert supervised[-3:] == ["final", "answer", "<eos>"]
+    assert masked["input_ids"] == default["input_ids"]
+    assert masked["loss_mask"] == default["loss_mask"]
+    assert "<think>" in _decode(tok, masked)
 
 
-def test_mask_generation_prompt_accepts_generation_prompt_suffix():
+def test_mask_generation_prompt_uses_the_mode_that_appends_when_the_other_rewrites_history():
+    # ``enable_thinking=False`` inserts ``/nothink`` into the user turn, so that prompt render is
+    # not the prefix plus an appended block and is ignored. The thinking prompt still appends
+    # ``<assistant> <think>`` to the unchanged prefix, so exactly those two tokens are masked;
+    # the ``</think>`` only the ignored prompt would have supplied stays supervised.
     tok = _StubTokenizerChatNoGenThinkingNoThinkSuffix()
 
     masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    inv[tok._start_of_turn_token_id] = "<sot>"
-    supervised = [inv[i] for i, keep in zip(masked["input_ids"], masked["loss_mask"]) if keep]
-
-    # ``/nothink`` never appears in the rendered turn, but the rest of the generation
-    # prompt (``<assistant> <think> </think>``) does and is masked.
     assert tok._id_for_token("/nothink") not in masked["input_ids"]
-    assert supervised == ["final", "answer", "<eos>"]
+    assert _decode(tok, masked) == ["</think>", "final", "answer", "<eos>"]
 
 
-def test_mask_generation_prompt_matches_prompt_with_extra_leading_and_trailing_tokens():
-    # The generation prompt both starts before the header (system rewrite) and ends with an
-    # empty think block the training render does not contain; only the header can be matched.
+def test_mask_generation_prompt_falls_back_to_the_mode_whose_prompt_the_turn_reproduces():
+    # The non-thinking prompt both rewrites the system block and ends with an empty think block
+    # the training render does not contain, so it is ignored; the thinking prompt appends the
+    # bare header, which the turn reproduces in full, so exactly the header is masked.
     tok = _StubTokenizerChatNoGenThinkingPromptOnlyBlock()
 
     default = _format(tok, _NO_REASONING)
     masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    inv[tok._start_of_turn_token_id] = "<sot>"
-
-    def supervised(sample):
-        return [inv[i] for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
-
-    assert supervised(default) == ["<assistant>", "final", "answer", "<eos>"]
-    assert supervised(masked) == ["final", "answer", "<eos>"]
+    assert _decode(tok, default) == ["<assistant>", "final", "answer", "<eos>"]
+    assert _decode(tok, masked) == ["final", "answer", "<eos>"]
 
 
-def test_mask_generation_prompt_does_not_anchor_on_earlier_rendered_turn():
-    # The generation prompt's added tokens contain the FIRST assistant turn verbatim, and
-    # both turns share the same content. Anchoring on that earlier copy would mask real
-    # content, so the match must use the last occurrence (the prompt's own header).
+def test_mask_generation_prompt_ignores_the_mode_that_rewrites_history():
+    # ``enable_thinking=False`` rewrites the render from its first token, so its added tokens
+    # contain the first assistant turn verbatim while both turns share the same content. That
+    # render is not the prefix plus an appended block and masks nothing; the thinking prompt
+    # appends ``<assistant> <think>`` and only those leave the loss in each turn.
     tok = _StubTokenizerChatNoGenThinkingSystemRewrite()
     messages = [
         {"role": "user", "content": "q1"},
@@ -1578,12 +1554,8 @@ def test_mask_generation_prompt_does_not_anchor_on_earlier_rendered_turn():
     ]
 
     masked = _format(tok, messages, mask_generation_prompt=True)
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    inv[tok._start_of_turn_token_id] = "<sot>"
-    supervised = [inv[i] for i, keep in zip(masked["input_ids"], masked["loss_mask"]) if keep]
-
-    assert supervised == ["same", "answer", "<eos>", "same", "answer", "<eos>"]
+    body = ["</think>", "same", "answer", "<eos>"]
+    assert _decode(tok, masked) == body + body
 
 
 def test_mask_generation_prompt_masks_leading_assistant_turn_from_empty_prefix():
@@ -1743,13 +1715,6 @@ class _StubTokenizerChatNoGenRewriteNoHeader(_StubTokenizerChatNoGenThinking):
         return ids
 
 
-def _decode(tok, sample):
-    inv = {v: k for k, v in tok._vocab.items()}
-    inv[tok.eos_token_id] = "<eos>"
-    inv[tok._start_of_turn_token_id] = "<sot>"
-    return [inv[i] for i, keep in zip(sample["input_ids"], sample["loss_mask"]) if keep]
-
-
 def test_mask_generation_prompt_keeps_think_opener_when_reasoning_is_inline_in_content():
     # No reasoning_content key, but the content carries the trace. The thinking prompt (bare
     # header) reproduces the turn completely, the non-thinking prompt only partially, so the
@@ -1778,10 +1743,10 @@ def test_mask_generation_prompt_masks_plain_text_header_ending_with_its_first_to
     assert _decode(tok, masked) == ["final", "answer", "<eos>"]
 
 
-def test_mask_generation_prompt_rejects_anchor_inside_rendered_history():
+def test_mask_generation_prompt_ignores_a_prompt_render_that_only_rewrites_history():
     # The prompt render adds no header, only a rewritten history whose last assistant header
-    # is followed by a real turn (and its EOS). Matching from there would mask content, so
-    # that anchor is rejected and the turn is left as the assistant mask had it.
+    # is followed by a real turn (and its EOS). That render is not the prefix plus an appended
+    # block, so it masks nothing and the turn is left as the assistant mask had it.
     tok = _StubTokenizerChatNoGenRewriteNoHeader()
     messages = [
         {"role": "user", "content": "q1"},
@@ -1794,19 +1759,21 @@ def test_mask_generation_prompt_rejects_anchor_inside_rendered_history():
     assert masked["loss_mask"] == default["loss_mask"]
 
 
-def test_match_generation_prompt_prefers_complete_then_longer_match():
-    eos = 99
-    # Prompt starts at the turn: complete match of all 3 tokens.
-    assert _match_generation_prompt([7, 8, 9], [7, 8, 9, 1, 2], eos) == (3, True)
-    # Prompt extends past the turn (SmolLM3): partial, anchored at its start.
-    assert _match_generation_prompt([7, 8, 9, 5, 6], [7, 8, 9, 1, 2], eos) == (3, False)
-    # Prompt starts before the header (GLM's /nothink): anchored at the last occurrence.
-    assert _match_generation_prompt([4, 4, 7, 8, 9], [7, 8, 9, 1, 2], eos) == (3, True)
-    # Last occurrence followed by an end-of-turn token is rendered history, not a prompt.
-    assert _match_generation_prompt([7, 8, eos, 3], [7, 8, 9], eos) == (2, False)
-    assert _match_generation_prompt([4, 7, 8, eos, 3], [7, 8, 9], eos) == (0, False)
-    assert _match_generation_prompt([], [7], eos) == (0, False)
-    assert _match_generation_prompt([7], [], eos) == (0, False)
+def test_appended_generation_prompt_length_accepts_only_a_fully_reproduced_appended_block():
+    base, turn = [1, 2], [7, 8, 9, 5, 6, 2]
+    # The prompt appends [7, 8, 9] and the turn opens with all of it.
+    assert _appended_generation_prompt_length(base, [1, 2, 7, 8, 9], turn) == 3
+    # The turn reproduces the block only partly (SmolLM3, Qwen3-Thinking without reasoning).
+    assert _appended_generation_prompt_length(base, [1, 2, 7, 8, 9, 4], turn) == 0
+    # The prompt render rewrites the prefix (a thinking system block) or inserts tokens ahead
+    # of the header (GLM's /nothink): not an appended block.
+    assert _appended_generation_prompt_length(base, [1, 4, 2, 7, 8, 9], turn) == 0
+    assert _appended_generation_prompt_length(base, [1, 2, 4, 7, 8, 9], turn) == 0
+    # The template ignores add_generation_prompt.
+    assert _appended_generation_prompt_length(base, [1, 2], turn) == 0
+    # A block equal to the whole turn is still the template's own text.
+    assert _appended_generation_prompt_length(base, [1, 2, 7, 8, 9], [7, 8, 9]) == 3
+    assert _appended_generation_prompt_length(base, [1, 2, 7], []) == 0
 
 
 def test_mask_generation_prompt_handles_left_truncation_with_generation_kwd():
@@ -1873,9 +1840,10 @@ def test_mask_generation_prompt_reuses_multiturn_prefix_renders():
     plain_prefix_renders = [n for n, gen, original in calls if not gen and original and n < len(messages)]
     # Each proper prefix (1, 2, 3 messages) is rendered once and shared by both builders.
     assert sorted(plain_prefix_renders) == [1, 2, 3]
-    # Plus three bound renders per assistant turn (the turn with its text removed and swapped
-    # for each of the two sentinels).
-    assert sorted(n for n, gen, original in calls if not gen and not original) == [2, 2, 2, 4, 4, 4]
+    # Nothing else is rendered plain: beyond the shared prefix renders the option costs only
+    # its two prompt renders (both thinking modes) per assistant turn.
+    assert [n for n, gen, original in calls if not gen and not original] == []
+    assert sorted(n for n, gen, original in calls if gen) == [1, 1, 3, 3]  # the template reads enable_thinking
 
     # truncation=True on a sample that fits is not a truncation: the prefix renders are still
     # shared and the full conversation is not rendered again as an untruncated reference.
@@ -1883,6 +1851,28 @@ def test_mask_generation_prompt_reuses_multiturn_prefix_renders():
     calls.clear()
     _format(tok, messages, mask_generation_prompt=True, truncation=True, seq_length=512)
     assert sorted(n for n, gen, original in calls if not gen and original) == plain_renders
+
+
+def test_mask_generation_prompt_renders_one_prompt_when_the_template_never_reads_enable_thinking():
+    # enable_thinking is a template variable, so a template that never reads it renders the same
+    # prompt in both modes; only one render is issued, and without the keyword, which a backend
+    # without Jinja templates (MistralCommonBackend) rejects outright.
+    seen = []
+
+    class _NoThinkingVariable(_StubTokenizerChatNoGenThinking):
+        chat_template = "<dummy template that never reads the thinking flag>"
+
+        def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
+            if kwargs.get("add_generation_prompt"):
+                seen.append(kwargs)
+                if "enable_thinking" in kwargs:
+                    raise ValueError("Kwargs ['enable_thinking'] are not supported")
+            return super().apply_chat_template(messages, **kwargs)
+
+    tok = _NoThinkingVariable()
+    masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
+    assert _decode(tok, masked) == ["</think>", "final", "answer", "<eos>"]
+    assert len(seen) == 1
 
 
 def test_multiturn_mask_retains_prefix_ids_only_when_generation_prompt_is_masked(monkeypatch):
@@ -1909,7 +1899,7 @@ def test_multiturn_mask_retains_prefix_ids_only_when_generation_prompt_is_masked
     off = _format(tok, messages)
     on = _format(tok, messages, mask_generation_prompt=True)
     assert seen[0] is None
-    assert sorted(seen[1]) == [1, 2, 3, 4]  # the shared cache holds every prefix render
+    assert sorted(seen[1]) == [1, 2, 3]  # the shared cache holds every proper prefix render
     assert on["input_ids"] == off["input_ids"]
 
     # The length-only path and the shared-cache path place the assistant spans identically.
@@ -1920,7 +1910,7 @@ def test_multiturn_mask_retains_prefix_ids_only_when_generation_prompt_is_masked
         tok, messages, full, unpadded_full_ids=full, prefix_cache=cache
     )
     assert by_length == by_cache
-    assert sorted(cache) == [1, 2, 3, 4]
+    assert sorted(cache) == [1, 2, 3]
 
 
 class _StubTokenizerChatNoGenGemmaLike(_StubTokenizerChatNoGen):
@@ -1929,7 +1919,7 @@ class _StubTokenizerChatNoGenGemmaLike(_StubTokenizerChatNoGen):
     header; and ``enable_thinking=True`` rewrites the render from its first token (a thinking
     system block), so the generation prompt's added tokens contain the whole conversation."""
 
-    chat_template = "<dummy gemma-like template>"
+    chat_template = "<dummy gemma-like enable_thinking template>"
 
     def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
         ids: List[int] = [self._start_of_turn_token_id]
@@ -1968,20 +1958,25 @@ class _StubTokenizerChatNoGenGemmaLike(_StubTokenizerChatNoGen):
 _TOOL_CALL = [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Paris"}}}]
 
 
-def test_mask_generation_prompt_never_reaches_content_when_eot_differs_from_eos():
-    # Regression for a continuation turn (no header) whose text repeats earlier text. The
-    # thinking prompt render rewrites history, so the last occurrence of the turn's first
-    # token inside it is followed by that earlier copy and an <eot> the eos guard does not
-    # know. The structural bound (a render with the content swapped out) must stop the
-    # match at zero tokens; only the tool-call turn's header may be removed.
-    tok = _StubTokenizerChatNoGenGemmaLike()
-    text = "The weather in Paris is sunny."
-    messages = [
+def _tool_call_continuation(text: str) -> list[dict]:
+    """A tool-call turn, its response, and a final assistant turn that continues without a header."""
+    return [
         {"role": "user", "content": text},
         {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
         {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
         {"role": "assistant", "content": text},
     ]
+
+
+def test_mask_generation_prompt_never_reaches_content_when_eot_differs_from_eos():
+    # Regression for a continuation turn (no header) whose text repeats earlier text. The
+    # thinking prompt render rewrites history (a thinking system block), so it is not the
+    # prefix plus an appended block and is ignored; the non-thinking prompt appends nothing
+    # after a tool response. Nothing of the continuation turn is masked, and the tool-call
+    # turn loses exactly its header.
+    tok = _StubTokenizerChatNoGenGemmaLike()
+    text = "The weather in Paris is sunny."
+    messages = _tool_call_continuation(text)
 
     default = _format(tok, messages)
     masked = _format(tok, messages, mask_generation_prompt=True)
@@ -1991,86 +1986,24 @@ def test_mask_generation_prompt_never_reaches_content_when_eot_differs_from_eos(
     assert _decode(tok, masked) == body
 
 
-def test_mask_generation_prompt_bound_caps_offset_zero_anchor():
-    # The prompt render both starts at the turn's first token and continues with the turn's
-    # own text (an offset-0 anchor that reproduces real content). Without the bound the whole
-    # turn would be masked.
-    class _EchoesTurn(_StubTokenizerChatNoGen):
-        chat_template = "<dummy echoing template>"
-
-        def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
-            ids: List[int] = [self._start_of_turn_token_id]
-            for msg in messages:
-                ids.append(self._id_for_token(f"<{msg['role']}>"))
-                ids.extend(self._id_for_token(tok) for tok in str(msg["content"]).split())
-                ids.append(self._id_for_token("<eot>"))
-            if kwargs.get("add_generation_prompt"):
-                ids.append(self._id_for_token("<assistant>"))
-                ids.extend(self._id_for_token(tok) for tok in "final answer".split())
-                ids.append(self._id_for_token("<eot>"))
-            if kwargs.get("return_dict", False):
-                return {"input_ids": ids}
-            return ids
-
-    tok = _EchoesTurn()
-    default = _format(tok, _NO_REASONING)
-    masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
-    assert _decode(tok, default) == ["<assistant>", "final", "answer", "<eot>"]
-    assert _decode(tok, masked) == ["final", "answer", "<eot>"]
-
-
-def test_perturbed_assistant_message_swaps_generated_text_and_drops_tool_calls():
-    message = {
-        "role": "assistant",
-        "name": "bot",
-        "content": "0.5 kg",
-        "reasoning_content": "weigh it",
-        "tool_calls": _TOOL_CALL,
-        "tool_responses": [{"name": "get_weather", "response": "sunny"}],
-    }
-    perturbed = _perturbed_assistant_message(message, "1")
-    assert perturbed == {
-        "role": "assistant",
-        "name": "bot",
-        "content": "1",
-        "reasoning_content": "1",
-        "tool_responses": message["tool_responses"],  # environment text, not model output
-    }
-    assert message["tool_calls"] is _TOOL_CALL  # the original is untouched
-
-    parts = {"role": "assistant", "content": [{"type": "image"}, {"type": "text", "text": "0 apples"}]}
-    assert _perturbed_assistant_message(parts, "1")["content"] == [{"type": "image"}, {"type": "text", "text": "1"}]
-    assert _perturbed_assistant_message({"role": "assistant", "content": None, "reasoning": "r"}, "0") == {
-        "role": "assistant",
-        "content": "0",
-        "reasoning": "0",
-    }
-
-
 class _StubTokenizerChatNoGenGemmaLikeNormalizing(_StubTokenizerChatNoGenGemmaLike):
     """Gemma-like stub whose vocabulary folds full-width digits onto ASCII (NFKC-style
     normalization), so two texts that differ as characters can share a token id."""
 
-    chat_template = "<dummy gemma-like normalizing template>"
+    chat_template = "<dummy gemma-like normalizing enable_thinking template>"
 
     def _id_for_token(self, tok: str) -> int:
         return super()._id_for_token(unicodedata.normalize("NFKC", tok))
 
 
-def test_mask_generation_prompt_bound_is_token_level_under_normalization():
-    # The answer starts with a full-width zero that the tokenizer normalizes onto the same
-    # id as the ASCII "0" sentinel. A character-level sentinel would share the first content
-    # token with the real render and let the bound reach it; the token-level bound uses a
-    # second sentinel that cannot also collide, so the header-less continuation turn keeps
-    # every generated token supervised.
+def test_mask_generation_prompt_is_unaffected_by_normalization_of_message_text():
+    # The answer starts with a full-width zero that the tokenizer folds onto ASCII "0". No
+    # message text is ever rendered or compared, only the prompt render is, so normalization
+    # between message and template text cannot widen the mask: the header-less continuation
+    # turn keeps every generated token supervised.
     tok = _StubTokenizerChatNoGenGemmaLikeNormalizing()
     text = "０ degrees in Paris"
-    messages = [
-        {"role": "user", "content": "How cold is it?"},
-        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
-        {"role": "tool", "tool_call_id": "c1", "content": "0"},
-        {"role": "assistant", "content": text},
-    ]
+    messages = _tool_call_continuation(text)
     assert tok._id_for_token("０") == tok._id_for_token("0")
 
     default = _format(tok, messages)
@@ -2083,10 +2016,12 @@ def test_mask_generation_prompt_bound_is_token_level_under_normalization():
 
 class _StubTokenizerChatNoGenGemmaLikeWordStart(_StubTokenizerChatNoGenGemmaLike):
     """Gemma-like stub whose tokenizer opens every non-empty message text with a
-    ``<word_start>`` token: a content-owned prefix that is the same for any value, so every
-    sentinel render shares its first content token with the real render."""
+    ``<word_start>`` token: a content-owned prefix that is the same for any value. With
+    ``empty_placeholder`` set, an assistant turn with empty content and no tool calls renders
+    a placeholder carrying the marker's id before its closing token instead."""
 
-    chat_template = "<dummy gemma-like word-start template>"
+    chat_template = "<dummy gemma-like word-start enable_thinking template>"
+    empty_placeholder = False
 
     def apply_chat_template(self, messages, **kwargs):  # type: ignore[override]
         ids: List[int] = [self._start_of_turn_token_id]
@@ -2112,6 +2047,8 @@ class _StubTokenizerChatNoGenGemmaLikeWordStart(_StubTokenizerChatNoGenGemmaLike
             if content:
                 ids.append(self._id_for_token("<word_start>"))
                 ids.extend(self._id_for_token(tok) for tok in content.split())
+            elif self.empty_placeholder and role == "assistant" and not msg.get("tool_calls"):
+                ids.append(self._id_for_token("<word_start>"))
             if not msg.get("tool_calls"):
                 ids.append(self._id_for_token("<eot>"))
             prev = role
@@ -2125,89 +2062,52 @@ class _StubTokenizerChatNoGenGemmaLikeWordStart(_StubTokenizerChatNoGenGemmaLike
         return ids
 
 
-def test_mask_generation_prompt_bound_excludes_content_owned_prefix_token():
-    # Every sentinel render shares a content-owned first token with the real render (the
-    # tokenizer opens any value with the same token), so two diverging sentinels alone would
-    # still prove nothing about that token. The bound is also capped by the render with the
-    # generated text removed entirely, which has no such token: the header-less continuation
-    # turn keeps every generated token, including <word_start>, supervised.
-    tok = _StubTokenizerChatNoGenGemmaLikeWordStart()
+class _StubTokenizerChatNoGenGemmaLikeColliding(_StubTokenizerChatNoGenGemmaLikeWordStart):
+    """Word-start stub whose content marker and closing ``<eot>`` share one id (as normalization
+    or an UNK mapping can do)."""
+
+    chat_template = "<dummy gemma-like colliding enable_thinking template>"
+
+    def _id_for_token(self, tok: str) -> int:
+        return super()._id_for_token("<eot>" if tok == "<word_start>" else tok)
+
+
+class _StubTokenizerChatNoGenGemmaLikeEmptyPlaceholder(_StubTokenizerChatNoGenGemmaLikeWordStart):
+    """Word-start stub that renders an empty-content assistant turn as a placeholder carrying the
+    marker's id before ``<eot>``."""
+
+    chat_template = "<dummy gemma-like empty-placeholder enable_thinking template>"
+    empty_placeholder = True
+
+
+@pytest.mark.parametrize(
+    "stub, marker",
+    [
+        (_StubTokenizerChatNoGenGemmaLikeWordStart, "<word_start>"),
+        (_StubTokenizerChatNoGenGemmaLikeColliding, "<eot>"),
+        (_StubTokenizerChatNoGenGemmaLikeEmptyPlaceholder, "<word_start>"),
+    ],
+)
+def test_mask_generation_prompt_keeps_every_generated_token_of_a_header_less_continuation_turn(stub, marker):
+    # The tokenizer opens any message text with a content-owned marker: one that only follows
+    # text, one that shares its id with the closing token, and one whose id an empty-content
+    # placeholder carries too. Comparing renders of the turn with its text removed would take
+    # each of them for template text; only the prompt render is compared, and it holds no
+    # message text, so the continuation turn keeps every generated token supervised and the
+    # tool-call turn loses exactly its header.
+    tok = stub()
     text = "The weather in Paris is sunny."
-    messages = [
-        {"role": "user", "content": text},
-        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
-        {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
-        {"role": "assistant", "content": text},
-    ]
+    messages = _tool_call_continuation(text)
+    if stub.empty_placeholder:
+        emptied = tok.apply_chat_template(messages[:3] + [{"role": "assistant", "content": ""}])
+        assert emptied[-2:] == [tok._id_for_token("<word_start>"), tok._id_for_token("<eot>")]
 
     default = _format(tok, messages)
     masked = _format(tok, messages, mask_generation_prompt=True)
     assert masked["input_ids"] == default["input_ids"]
-    body = ["<tool_call>", "get_weather", "</tool_call>", "<word_start>", *text.split(), "<eot>"]
+    body = ["<tool_call>", "get_weather", "</tool_call>", marker, *text.split(), "<eot>"]
     assert _decode(tok, default) == ["<assistant>", *body]
     assert _decode(tok, masked) == body
-
-
-def test_mask_generation_prompt_bound_ignores_token_string_prefix_relation():
-    # Byte-level tokenizers expose internal token strings that can stand in a prefix relation
-    # while their decoded text does not (Nemotron 3.5: "iá»" -> "i�" and "iá»ģm" -> "iềm").
-    # Here the generated <word_start> token's internal string is a strict prefix of the string of
-    # the token the empty render has in its place (<eot>). That relation must not move the
-    # content boundary: <word_start> is model output and stays supervised.
-    class _InternalStrings(_StubTokenizerChatNoGenGemmaLikeWordStart):
-        chat_template = "<dummy gemma-like internal-strings template>"
-
-        def convert_ids_to_tokens(self, token_id: int) -> str:
-            names = {v: k for k, v in self._vocab.items()}
-            return {"<word_start>": "iá»", "<eot>": "iá»ģm"}.get(names.get(token_id), names.get(token_id, ""))
-
-    tok = _InternalStrings()
-    text = "The weather in Paris is sunny."
-    messages = [
-        {"role": "user", "content": text},
-        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
-        {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
-        {"role": "assistant", "content": text},
-    ]
-    default = _format(tok, messages)
-    masked = _format(tok, messages, mask_generation_prompt=True)
-    assert tok.convert_ids_to_tokens(tok._id_for_token("<eot>")).startswith(
-        tok.convert_ids_to_tokens(tok._id_for_token("<word_start>"))
-    )
-    assert masked["input_ids"] == default["input_ids"]
-    body = ["<tool_call>", "get_weather", "</tool_call>", "<word_start>", *text.split(), "<eot>"]
-    assert _decode(tok, masked) == body
-
-
-def test_mask_generation_prompt_bound_fails_closed_when_closing_and_content_tokens_collide():
-    # The content-owned <word_start> marker and the closing <eot> map to the same id (as
-    # normalization or an UNK mapping can do). On the header-less continuation turn the empty
-    # render is then [X] and a prefix of the real turn [X, text..., X], so prefix comparison
-    # alone would mask the generated marker. Aligning the empty render from its end recognizes
-    # that X as the closing: nothing of the continuation turn is masked, and the tool-call turn
-    # still loses exactly its <assistant> header.
-    class _Colliding(_StubTokenizerChatNoGenGemmaLikeWordStart):
-        chat_template = "<dummy gemma-like colliding template>"
-
-        def _id_for_token(self, tok: str) -> int:
-            return super()._id_for_token("<eot>" if tok == "<word_start>" else tok)
-
-    tok = _Colliding()
-    text = "The weather in Paris is sunny."
-    messages = [
-        {"role": "user", "content": text},
-        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALL},
-        {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
-        {"role": "assistant", "content": text},
-    ]
-    default = _format(tok, messages)
-    masked = _format(tok, messages, mask_generation_prompt=True)
-    assert masked["input_ids"] == default["input_ids"]
-    final_span = len(text.split()) + 2  # <word_start> (== <eot> id), words, <eot>
-    assert default["loss_mask"][-final_span:] == [1] * final_span
-    assert masked["loss_mask"][-final_span:] == [1] * final_span
-    header = default["input_ids"].index(tok._id_for_token("<assistant>"), 1)
-    assert [i for i, (a, b) in enumerate(zip(default["loss_mask"], masked["loss_mask"])) if a != b] == [header]
 
 
 class _StubTokenizerChatNoGenQwen3ThinkingLike(_StubTokenizerChatNoGen):
@@ -2243,9 +2143,6 @@ class _StubTokenizerChatNoGenQwen3ThinkingLike(_StubTokenizerChatNoGen):
             return {"input_ids": ids}
         return ids
 
-    def convert_ids_to_tokens(self, token_id: int) -> str:
-        return {v: k for k, v in self._vocab.items()}.get(token_id, "<eos>")
-
 
 _QWEN3_THINKING_REASONING = [
     {"role": "user", "content": "How many legs does a spider have?"},
@@ -2253,39 +2150,28 @@ _QWEN3_THINKING_REASONING = [
 ]
 
 
-def test_mask_generation_prompt_empty_render_bound_stops_at_merged_template_token():
-    # With the reasoning text removed the template's "\n" after <think> fuses with the "\n"
-    # before </think> into one "\n\n" token, so the empty render diverges from the real turn one
-    # token early. Nothing on the token ids proves that "\n" is template text (its token string
-    # being a prefix of the merged token's is not a proof, see the test below), so the bound
-    # fails closed there: <assistant> <think> leave the loss and the "\n" keeps its supervision.
+def test_mask_generation_prompt_masks_the_whole_thinking_prompt_on_a_reasoning_turn():
+    # The prompt appends ``<assistant> <think> \n`` and a reasoning turn opens with exactly those
+    # tokens, so all three leave the loss, the "\n" the model never generates included.
     tok = _StubTokenizerChatNoGenQwen3ThinkingLike()
     default = _format(tok, _QWEN3_THINKING_REASONING)
     masked = _format(tok, _QWEN3_THINKING_REASONING, mask_generation_prompt=True)
     assert masked["input_ids"] == default["input_ids"]
-    body = ["\n", "count", "them", "\n", "</think>", "\n\n", "eight", "<eos>"]
-    assert _decode(tok, default) == ["<assistant>", "<think>", *body]
+    body = ["count", "them", "\n", "</think>", "\n\n", "eight", "<eos>"]
+    assert _decode(tok, default) == ["<assistant>", "<think>", "\n", *body]
     assert _decode(tok, masked) == body
 
 
-def test_mask_generation_prompt_fails_closed_when_sentinel_renders_do_not_diverge():
-    # A tokenizer that maps every single-character text onto one UNK id renders both sentinels
-    # identically, so nothing about the generated-text boundary is proven: the bound is zero and
-    # even the real header stays in the loss rather than risking assistant content.
-    class _UnkSingleChars(_StubTokenizerChatNoGenThinking):
-        chat_template = "<dummy unk template>"
-
-        def _id_for_token(self, tok: str) -> int:
-            if len(tok) == 1:
-                return 0  # UNK
-            return super()._id_for_token(tok)
-
-    tok = _UnkSingleChars()
+def test_mask_generation_prompt_fails_closed_when_the_turn_reproduces_the_prompt_only_partly():
+    # Without reasoning text the "\n" after <think> fuses with the one before </think> into a
+    # single "\n\n" token, so the turn reproduces only ``<assistant> <think>`` of the three-token
+    # prompt. A partial match cannot tell where the template stops and the message starts, so
+    # nothing is masked and the turn stays as answer-only masking left it.
+    tok = _StubTokenizerChatNoGenQwen3ThinkingLike()
     default = _format(tok, _NO_REASONING)
     masked = _format(tok, _NO_REASONING, mask_generation_prompt=True)
-    assert masked["input_ids"] == default["input_ids"]
     assert masked["loss_mask"] == default["loss_mask"]
-    assert _decode(tok, default) == ["<assistant>", "<think>", "</think>", "final", "answer", "<eos>"]
+    assert _decode(tok, masked) == ["<assistant>", "<think>", "\n\n", "</think>", "\n\n", "final", "answer", "<eos>"]
 
 
 class _StubTokenizerChatGenSymmetricTurns(_StubTokenizerChatNoGen):
