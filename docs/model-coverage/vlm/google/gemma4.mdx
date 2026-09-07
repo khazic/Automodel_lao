@@ -82,10 +82,10 @@ model:
   _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
   pretrained_model_name_or_path: google/gemma-4-E2B-it
   ngram_config:
-    ngram_size: 3          # bigram + trigram heads
-    heads_per_ngram: 4
-    head_dim: 128
-    rows_per_head: 1000000 # 8 heads x ~1M rows x 128 = ~1B parameters
+    ngram_size: 3          # bigram + trigram heads, as in Qwen3.8-Flash-Next
+    heads_per_ngram: 8     # 16 heads x 96 = the 1536 hidden width
+    head_dim: 96
+    rows_per_head: 666000  # 16 heads x ~666k rows x 96 = ~1B parameters
     layer_index: 1
     eos_token_ids: [1, 2]  # EOS and BOS: nanogpt shards delimit documents with BOS
 ```
