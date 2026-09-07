@@ -99,6 +99,7 @@ from nemo_automodel.shared.utils import dtype_from_str as get_dtype
 
 from .cp_attention import attach_gemma4_cp_ring_attention, gemma4_vision_group_ids
 from .cp_batch import make_contiguous_aux_only_shard_cp_batch_and_ctx
+from .ngram import Gemma4NGramConfig, Gemma4NGramInjection
 from .parallelization import register_gemma4_parallel_strategy
 from .sdpa_fp32 import enable_gemma4_sdpa_fp32
 
@@ -1087,6 +1088,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         moe_config: MoEConfig | None = None,
         backend: BackendConfig | None = None,
         text_config: dict | None = None,
+        ngram_config: Gemma4NGramConfig | dict | None = None,
         **kwargs,
     ):
         if not _GEMMA4_HF_AVAILABLE:
@@ -1095,6 +1097,10 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         # lm_head NeMo doesn't build, so reject tie_word_embeddings=False up front.
         reject_unsupported_tie_word_embeddings(type(self), config)
         backend = backend or BackendConfig()
+        # YAML hands the n-gram settings over as a plain mapping; type it here so
+        # the rest of the model only sees the frozen config.
+        if isinstance(ngram_config, dict):
+            ngram_config = Gemma4NGramConfig(**ngram_config)
 
         # Merge text_config overrides (e.g. from YAML) into the proper config
         # object before HF __init__ which needs a real PretrainedConfig.
@@ -1138,8 +1144,18 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
             pad_token_id = eos_token_id
         self.pad_token_id = pad_token_id if pad_token_id is not None else -1
 
+        # The n-gram delta hooks the HF dense decoder layers; the MoE backend
+        # rebuilds the decoder and has not been wired for it.
+        self._ngram_hook_handle = None
+        if ngram_config is not None and enable_moe:
+            raise NotImplementedError(
+                "ngram_config is only supported on dense Gemma4 variants (enable_moe_block=False)"
+            )
+
         if not enable_moe:
             self._apply_cp_attention_backend_policy()
+            if ngram_config is not None:
+                self._attach_ngram(ngram_config, text_config)
             return
 
         # --- MoE path: replace the text model ---
@@ -1174,6 +1190,34 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 self.backend,
                 dtype=get_dtype(getattr(text_config, "torch_dtype", None), torch.bfloat16),
             )
+
+    def _attach_ngram(self, ngram_config: Gemma4NGramConfig, text_config: Gemma4TextConfig) -> None:
+        """Build the n-gram injection and hook it in front of its decoder layer.
+
+        The module lives at ``model.language_model.ngram`` (its own state-dict
+        prefix next to the HF decoder), and a forward pre-hook on
+        ``model.language_model.layers[layer_index]`` adds the delta to the
+        residual stream. The base checkpoint has no values for it, so its keys
+        are declared optional for the init-step load and keep their zero-delta
+        initialization.
+        """
+        language_model = self.model.language_model
+        ngram = ngram_config.build(
+            hidden_size=text_config.hidden_size,
+            num_hidden_layers=text_config.num_hidden_layers,
+            rms_norm_eps=text_config.rms_norm_eps,
+            dtype=language_model.embed_tokens.weight.dtype,
+        )
+        language_model.ngram = ngram
+        self._ngram_hook_handle = language_model.layers[ngram_config.layer_index].register_forward_pre_hook(
+            ngram.decoder_layer_pre_hook, with_kwargs=True
+        )
+        self._nemo_optional_base_checkpoint_key_prefixes = ("model.language_model.ngram.",)
+
+    @property
+    def ngram(self) -> Gemma4NGramInjection | None:
+        """The attached n-gram injection, or ``None`` when the model runs without one."""
+        return getattr(self.model.language_model, "ngram", None)
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie ``lm_head`` to the active text ``embed_tokens`` when requested.
@@ -1237,6 +1281,15 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         tp_e_series_enabled = bool(
             getattr(self, "_gemma4_tp_enabled", False) and getattr(text_config, "hidden_size_per_layer_input", 0)
         )
+        ngram = self.ngram
+        if ngram is not None:
+            if input_ids is None:
+                raise ValueError("Gemma4 n-gram injection requires input_ids; inputs_embeds alone cannot be hashed")
+            if cp_enabled or getattr(self, "_gemma4_tp_enabled", False):
+                raise NotImplementedError(
+                    "Gemma4 n-gram injection has not been wired for context or tensor parallelism"
+                )
+            ngram.stash_input_ids(input_ids)
         if not getattr(text_config, "enable_moe_block", False):
             per_layer_inputs = kwargs.pop("per_layer_inputs", None)
             if cp_enabled or tp_e_series_enabled:
@@ -1668,6 +1721,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         if not getattr(text_config, "enable_moe_block", False):
             for p in self.parameters():
                 p.data = p.data.to(dtype)
+            # The dense path never runs HF's random init (the base checkpoint
+            # overwrites every HF parameter), so the n-gram module, which the
+            # checkpoint does not cover, must get its zero-delta start here.
+            if (ngram := self.ngram) is not None:
+                ngram.reset_parameters()
             return
 
         # Guard: HF's super().__init__() calls post_init() -> init_weights() ->

@@ -56,6 +56,42 @@ slug: model-coverage/vision-language-models/google/gemma-4
 | [gemma4_31b_tp4_pp4.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_31b_tp4_pp4.yaml) | SFT — Gemma 4 31B with TP=4, PP=4 (multi-node) |
 | [gemma4_26b_a4b_moe.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe.yaml) | SFT — Gemma 4 26B-A4B MoE on MedPix |
 | [gemma4_26b_a4b_moe_peft.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/vlm_finetune/gemma4/gemma4_26b_a4b_moe_peft.yaml) | LoRA — Gemma 4 26B-A4B MoE on MedPix |
+| [gemma_4_e2b_ngram_fineweb.yaml](https://github.com/NVIDIA-NeMo/Automodel/blob/main/examples/llm_finetune/gemma/gemma_4_e2b_ngram_fineweb.yaml) | Continued pretraining — Gemma 4 E2B with a post-hoc N-gram Embedding table on FineWeb-Edu |
+
+## N-gram Embedding (experimental)
+
+Dense Gemma 4 checkpoints (E2B, E4B, 31B) can be extended with an Engram-style
+N-gram Embedding table, the mechanism Qwen3.8-Flash-Next ships pretrained. The
+current token and its preceding tokens are hashed into a packed multi-head
+table; the looked-up values are gated against the residual stream and, together
+with a causal short convolution, added in front of one decoder layer
+(`ngram_config.layer_index`). Hashed context never crosses the ids listed in
+`eos_token_ids`, so packed documents stay separate.
+
+The table is *added on top of the released checkpoint*: its value projection and
+convolution start at zero, so the model is bit-identical to the base checkpoint
+until the table is trained, and the base checkpoint loads without the new keys.
+Training checkpoints of the augmented model contain the table under
+`model.language_model.ngram.*` and load strictly. The table only becomes useful
+after continued pretraining on a large token budget; fine-tuning data alone does
+not populate it. Context and tensor parallelism, and the 26B-A4B MoE variant, are
+not supported with the table.
+
+```yaml
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-E2B-it
+  ngram_config:
+    ngram_size: 3          # bigram + trigram heads
+    heads_per_ngram: 4
+    head_dim: 128
+    rows_per_head: 1000000 # 8 heads x ~1M rows x 128 = ~1B parameters
+    layer_index: 1
+    eos_token_ids: [1, 2]  # EOS and BOS: nanogpt shards delimit documents with BOS
+```
+
+Give the fresh table its own learning rate with `optimizer.param_group_overrides`
+(see the example recipe); the pretrained backbone keeps the base rate.
 
 ## Try with NeMo AutoModel
 

@@ -1,0 +1,146 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Continued pretraining of Gemma 4 E2B with a post-hoc Engram-style N-gram
+# Embedding table (about 1B parameters) on FineWeb-Edu.
+#
+# The table is added on top of the released checkpoint: it starts as an exact
+# no-op (zero value projection and convolution) and is trained together with
+# the backbone. Drop the `model.ngram_config` block to train the control arm on
+# the same tokens without the table.
+#
+# Prepare the token shards once (writes <output-dir>/dataset.bin plus a BOS index):
+#   uv run python tools/nanogpt_data_processor.py --dataset HuggingFaceFW/fineweb-edu \
+#     --set-name sample-10BT --tokenizer google/gemma-4-E2B-it \
+#     --output-dir /path/to/fineweb_edu_gemma4 --max-tokens 3000000000
+#
+# Then, from the AutoModel repository root:
+#   automodel examples/llm_finetune/gemma/gemma_4_e2b_ngram_fineweb.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+seed: 1234
+
+step_scheduler:
+  global_batch_size: 64
+  local_batch_size: 4
+  ckpt_every_steps: 500
+  val_every_steps: 250
+  gc_every_steps: 10
+  num_epochs: 1
+  max_steps: 4000
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 30
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 1234
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-E2B-it
+  torch_dtype: torch.bfloat16
+  use_liger_kernel: false
+  use_sdpa_patching: false
+  attn_implementation: sdpa
+  text_config:
+    use_cache: false
+  # 3-gram hashing with 4 heads per order: 8 heads x ~1M rows x 128 = 1.02B
+  # table parameters, injected in front of decoder layer 1 (the second layer,
+  # matching Qwen3.8-Flash-Next). The BOS id (2) is listed with EOS (1) because
+  # the nanogpt shards delimit documents with BOS, so the hashed context never
+  # crosses a document boundary.
+  ngram_config:
+    ngram_size: 3
+    heads_per_ngram: 4
+    head_dim: 128
+    rows_per_head: 1000000
+    layer_index: 1
+    eos_token_ids: [1, 2]
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/gemma_4_e2b_ngram_fineweb/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  dp_size: none
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  activation_checkpointing: false
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: /path/to/fineweb_edu_gemma4/dataset.bin  # REPLACE THIS
+  seq_len: 4096
+  shuffle_files: false
+  align_to_bos: false
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 2
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.nanogpt_dataset.NanogptDataset
+  file_pattern: /path/to/fineweb_edu_gemma4_val/dataset.bin  # REPLACE THIS
+  seq_len: 4096
+  shuffle_files: false
+  align_to_bos: false
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  shuffle: false
+  collate_fn: nemo_automodel.components.datasets.utils.default_collater
+  num_workers: 2
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-5
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.1
+  foreach: false
+  # The table is fresh, so it trains far faster than the pretrained backbone and
+  # skips weight decay (untouched rows must not shrink between lookups). The
+  # small projection/norm/conv parameters get an intermediate multiplier.
+  param_group_overrides:
+    - pattern: '\.ngram\.embedding\.table\.weight$'
+      lr_mult: 20.0
+      wd_mult: 0.0
+    - pattern: '\.ngram\.(key_proj|value_proj|norm_key|norm_query|norm_conv|conv1d)\.'
+      lr_mult: 10.0
+
+# Param-group multipliers are applied by OptimizerParamScheduler.step(), so a
+# scheduler is required even for a short run.
+lr_scheduler:
+  lr_decay_style: cosine
+  lr_warmup_steps: 100
+  min_lr: 1.0e-6
+
+wandb:
+  enable: false
+  project: gemma4_e2b_ngram
+  name: gemma4_e2b_ngram_fineweb_4k

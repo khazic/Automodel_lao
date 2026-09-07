@@ -2018,6 +2018,63 @@ class TestLoadModelExtraState:
         assert "module _extra_state keys" in caplog.text
         mock_model_state.load_state_dict.assert_called_once()
 
+    def test_model_declared_optional_keys_are_dropped_only_on_init_step(self, caplog):
+        checkpointer = self._make_checkpointer()
+        model = torch.nn.Module()
+        model._nemo_optional_base_checkpoint_key_prefixes = ("ngram.",)
+        initial_state_dict = {
+            "layer.weight": torch.zeros(2, 2),
+            "ngram.table.weight": torch.zeros(4, 2),
+        }
+        captured = {}
+
+        def fake_do_load(state_dict, *args, **kwargs):
+            captured["requested_keys"] = set(state_dict)
+            return {key: value.clone() for key, value in state_dict.items()}
+
+        def run(is_init_step: bool):
+            caplog.clear()
+            caplog.set_level(logging.WARNING)
+            with (
+                patch("os.path.exists", return_value=True),
+                patch("nemo_automodel.components.checkpoint.checkpointing.ModelState") as mock_model_state_cls,
+                patch.object(checkpointer, "_get_storage_reader", return_value=object()),
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_to_hf",
+                    side_effect=lambda module, state_dict, **kwargs: state_dict,
+                ),
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing._maybe_adapt_state_dict_from_hf",
+                    side_effect=lambda module, state_dict, **kwargs: state_dict,
+                ),
+                patch(
+                    "nemo_automodel.components.checkpoint.checkpointing._get_checkpoint_metadata_keys",
+                    return_value={"layer.weight"},
+                ) as mock_metadata,
+                patch.object(checkpointer, "_do_load", side_effect=fake_do_load),
+            ):
+                mock_model_state = mock_model_state_cls.return_value
+                mock_model_state.model = [model]
+                mock_model_state.state_dict.return_value = initial_state_dict.copy()
+                checkpointer.load_model(model, model_path="/fake/path", is_init_step=is_init_step)
+            return mock_model_state, mock_metadata
+
+        # Base-checkpoint init: the optional keys are absent from the checkpoint, so
+        # they are dropped before DCP, warned about, and the load turns non-strict.
+        mock_model_state, mock_metadata = run(is_init_step=True)
+        assert captured["requested_keys"] == {"layer.weight"}
+        mock_metadata.assert_called_once()
+        assert "model-declared optional keys" in caplog.text
+        assert "Checkpoint key mismatch" not in caplog.text
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is False
+
+        # Resuming a training checkpoint: the keys are requested and the checkpoint
+        # metadata is not consulted, so a missing table surfaces as a real error.
+        mock_model_state, mock_metadata = run(is_init_step=False)
+        assert captured["requested_keys"] == {"layer.weight", "ngram.table.weight"}
+        mock_metadata.assert_not_called()
+        assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is True
+
 
 # =============================================================================
 # Tests for Checkpointer.initialize_model_weights

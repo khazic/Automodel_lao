@@ -967,7 +967,19 @@ class Checkpointer:
         )
         checkpoint_metadata_keys: set[str] = set()
         extra_state_keys = sorted(key for key in state_dict if key.endswith("_extra_state"))
-        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys:
+        # A model may declare parameters it adds on top of the published base
+        # checkpoint (for example a post-hoc n-gram table). Those keys are optional
+        # only when initializing from the base checkpoint; a training checkpoint of
+        # the augmented model must contain them.
+        optional_key_prefixes = tuple(
+            getattr(_unwrap_ddp_model(model_state.model[0]), "_nemo_optional_base_checkpoint_key_prefixes", ()) or ()
+        )
+        optional_keys = (
+            sorted(key for key in state_dict if key.startswith(optional_key_prefixes))
+            if optional_key_prefixes and is_init_step
+            else []
+        )
+        if should_try_tied_lm_head_compat or allow_checkpoint_key_subset or extra_state_keys or optional_keys:
             checkpoint_metadata_keys = _get_checkpoint_metadata_keys(model_path, storage_reader)
         if extra_state_keys:
             missing_extra_state_keys = [key for key in extra_state_keys if key not in checkpoint_metadata_keys]
@@ -981,6 +993,18 @@ class Checkpointer:
                     len(missing_extra_state_keys),
                     missing_extra_state_keys[:10],
                 )
+        dropped_optional_keys = [key for key in optional_keys if key not in checkpoint_metadata_keys]
+        if dropped_optional_keys:
+            for key in dropped_optional_keys:
+                state_dict.pop(key, None)
+            logging.warning(
+                "Base checkpoint %s has no values for %d model-declared optional keys (prefixes=%s). "
+                "Keeping their current initialization (examples=%s).",
+                model_path,
+                len(dropped_optional_keys),
+                optional_key_prefixes,
+                dropped_optional_keys[:10],
+            )
         if should_try_tied_lm_head_compat:
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):
@@ -1066,6 +1090,7 @@ class Checkpointer:
             # Keys deliberately kept at init were already warned about above; keep
             # reporting unexpected keys, which nothing else surfaces.
             expected_keys_for_diff &= loaded_keys_for_diff
+        expected_keys_for_diff -= set(dropped_optional_keys)
         key_diff = _summarize_state_dict_key_diff(expected_keys_for_diff, loaded_keys_for_diff)
         if key_diff["missing_count"] or key_diff["unexpected_count"]:
             safe_moe_tp_requires_complete_checkpoint = any(
@@ -1090,7 +1115,12 @@ class Checkpointer:
             )
         model_state.load_state_dict(
             state_dict,
-            strict=not (len(model_state.model) > 1 or has_state_dict_adapter or allow_checkpoint_key_subset),
+            strict=not (
+                len(model_state.model) > 1
+                or has_state_dict_adapter
+                or allow_checkpoint_key_subset
+                or bool(dropped_optional_keys)
+            ),
             broadcast_from_rank0=self.process_group is None,
         )
         install_complete = time.monotonic()
