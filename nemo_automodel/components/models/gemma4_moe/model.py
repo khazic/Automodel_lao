@@ -19,7 +19,7 @@ GroupedExperts backend, enabling Expert Parallelism (EP) via the standard
 MoE parallelizer.
 """
 
-from collections.abc import MutableMapping
+from collections.abc import Iterable, MutableMapping
 from typing import Any, Iterator, Union
 
 import torch
@@ -1198,8 +1198,9 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
         prefix next to the HF decoder), and a forward pre-hook on
         ``model.language_model.layers[layer_index]`` adds the delta to the
         residual stream. The base checkpoint has no values for it, so its keys
-        are declared optional for the init-step load and keep their zero-delta
-        initialization.
+        are declared optional for the init-step load, and the loader asks
+        :meth:`reset_optional_base_checkpoint_parameters` to give them their
+        zero-delta initialization once it knows the checkpoint lacks them.
         """
         language_model = self.model.language_model
         ngram = ngram_config.build(
@@ -1218,6 +1219,23 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
     def ngram(self) -> Gemma4NGramInjection | None:
         """The attached n-gram injection, or ``None`` when the model runs without one."""
         return getattr(self.model.language_model, "ngram", None)
+
+    def reset_optional_base_checkpoint_parameters(self, keys: Iterable[str]) -> None:
+        """Initialize the n-gram module when the base checkpoint had no values for it.
+
+        The checkpoint loader calls this with the optional keys it dropped from the
+        init-step load. It cannot rely on :meth:`initialize_weights` having run:
+        the loader skips that entirely for models whose embeddings carry a
+        ``padding_idx`` under FSDP (DTensor row indexing), which left the table,
+        ``key_proj`` and ``value_proj`` all zero in an 8-GPU run and made the
+        branch a dead fixed point (zero output, zero gradient). Whole-tensor inits
+        work on DTensor parameters, so re-drawing here is safe after sharding.
+        """
+        ngram = self.ngram
+        if ngram is None:
+            return
+        if any(key.startswith("model.language_model.ngram.") for key in keys):
+            ngram.reset_parameters()
 
     def tie_weights(self, *_args: object, **_kwargs: object) -> None:
         """Tie ``lm_head`` to the active text ``embed_tokens`` when requested.

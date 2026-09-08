@@ -1005,6 +1005,15 @@ class Checkpointer:
                 optional_key_prefixes,
                 dropped_optional_keys[:10],
             )
+            # "Current initialization" is not guaranteed to exist: initialize_weights()
+            # is skipped for some models (DTensor embeddings with padding_idx), so these
+            # parameters may still hold whatever to_empty() left behind. Let the model
+            # initialize exactly the modules the checkpoint did not cover.
+            reset_optional = getattr(
+                _unwrap_ddp_model(model_state.model[0]), "reset_optional_base_checkpoint_parameters", None
+            )
+            if callable(reset_optional):
+                reset_optional(dropped_optional_keys)
         if should_try_tied_lm_head_compat:
             if lm_head_param_name not in checkpoint_metadata_keys:
                 for source_name in get_tied_lm_head_source_names(model_state.model[0], lm_head_param_name):

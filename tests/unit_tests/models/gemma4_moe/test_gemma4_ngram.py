@@ -290,6 +290,31 @@ class TestDenseGemma4Integration:
         assert torch.isfinite(model.ngram.embedding.table.weight).all()
         assert model.ngram.embedding.table.weight.std() > 0
 
+    def test_dropped_optional_keys_reinitialize_the_ngram_module(self):
+        # The loader skips initialize_weights() for some models (DTensor embeddings
+        # with padding_idx), so the n-gram parameters can still be the zeros left by
+        # to_empty(). With table AND value_proj at zero the branch is a fixed point:
+        # zero output and zero gradient forever. The loader therefore hands the
+        # dropped optional keys to the model, which must re-draw the module.
+        model = _build_dense_model(_tiny_ngram_config())
+        with torch.no_grad():
+            for p in model.ngram.parameters():
+                p.zero_()
+        model.reset_optional_base_checkpoint_parameters(["model.language_model.ngram.embedding.table.weight"])
+        assert model.ngram.embedding.table.weight.std() > 0
+        assert model.ngram.key_proj.weight.std() > 0
+        assert torch.equal(model.ngram.value_proj.weight, torch.zeros_like(model.ngram.value_proj.weight))
+        assert torch.equal(model.ngram.conv1d.weight, torch.zeros_like(model.ngram.conv1d.weight))
+
+    def test_unrelated_optional_keys_leave_the_ngram_module_alone(self):
+        model = _build_dense_model(_tiny_ngram_config())
+        with torch.no_grad():
+            model.ngram.embedding.table.weight.zero_()
+        model.reset_optional_base_checkpoint_parameters(["model.language_model.other.weight"])
+        assert torch.equal(model.ngram.embedding.table.weight, torch.zeros_like(model.ngram.embedding.table.weight))
+        # A model without the module must accept the call as a no-op.
+        _build_dense_model(None).reset_optional_base_checkpoint_parameters(["model.language_model.ngram.x"])
+
     def test_inputs_embeds_only_is_rejected(self):
         model = _build_dense_model(_tiny_ngram_config())
         embeds = torch.randn(1, 4, model.config.text_config.hidden_size)

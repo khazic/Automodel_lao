@@ -2022,6 +2022,7 @@ class TestLoadModelExtraState:
         checkpointer = self._make_checkpointer()
         model = torch.nn.Module()
         model._nemo_optional_base_checkpoint_key_prefixes = ("ngram.",)
+        model.reset_optional_base_checkpoint_parameters = MagicMock()
         initial_state_dict = {
             "layer.weight": torch.zeros(2, 2),
             "ngram.table.weight": torch.zeros(4, 2),
@@ -2067,12 +2068,17 @@ class TestLoadModelExtraState:
         assert "model-declared optional keys" in caplog.text
         assert "Checkpoint key mismatch" not in caplog.text
         assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is False
+        # The model is told exactly which keys it must initialize itself, since
+        # initialize_weights() may have been skipped for it.
+        model.reset_optional_base_checkpoint_parameters.assert_called_once_with(["ngram.table.weight"])
 
         # Resuming a training checkpoint: the keys are requested and the checkpoint
         # metadata is not consulted, so a missing table surfaces as a real error.
+        model.reset_optional_base_checkpoint_parameters.reset_mock()
         mock_model_state, mock_metadata = run(is_init_step=False)
         assert captured["requested_keys"] == {"layer.weight", "ngram.table.weight"}
         mock_metadata.assert_not_called()
+        model.reset_optional_base_checkpoint_parameters.assert_not_called()
         assert mock_model_state.load_state_dict.call_args.kwargs["strict"] is True
 
 
