@@ -37,6 +37,9 @@ def build(base, weights_dir, with_ngram):
         sd.update(load_file(f, device="cuda"))
     missing, unexpected = model.load_state_dict(sd, strict=False)
     missing = [k for k in missing if k != "lm_head.weight"]
+    # The base release still ships k/v projections for the KV-shared layers,
+    # which the HF model does not build.
+    unexpected = [k for k in unexpected if not k.endswith(("self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"))]
     log(f"loaded {len(sd)} tensors from {weights_dir}; missing={missing[:8]} ({len(missing)}) unexpected={unexpected[:8]} ({len(unexpected)})")
     if missing or unexpected:
         raise SystemExit("state dict mismatch")
@@ -106,6 +109,7 @@ def main():
     ap.add_argument("--per-source", type=int, default=24)
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--new-tokens", type=int, default=160)
+    ap.add_argument("--resume", action="store_true", help="skip models already in --out")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.base)
@@ -127,7 +131,12 @@ def main():
 
     eos = {1, 2, 106}
     result = {"loss": {}, "gen": {}}
-    for name, weights, with_ngram in [("ngram_64999", args.ckpt, True), ("base_e2b", args.base, False)]:
+    runs = [("ngram_64999", args.ckpt, True), ("base_e2b", args.base, False)]
+    if args.resume and os.path.exists(args.out):
+        with open(args.out) as fh:
+            result = json.load(fh)
+        runs = [r for r in runs if r[0] not in result["loss"]]
+    for name, weights, with_ngram in runs:
         model = build(args.base, weights, with_ngram)
         variants = [("", True), ("_ngram_off", False)] if with_ngram else [("", None)]
         for suffix, flag in variants:
