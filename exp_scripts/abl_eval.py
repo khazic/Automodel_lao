@@ -115,6 +115,9 @@ def task_mt(model, tok, with_ngram, args):
             ("English", name, eng_dev, dev, eng_test, test),
             (name, "English", dev, eng_dev, test, eng_test),
         ):
+            key = f"{'eng' if src_name == 'English' else code}->{'eng' if tgt_name == 'English' else code}"
+            if args.mt_dirs and key not in args.mt_dirs:
+                continue
             shots = "".join(f"{src_name}: {src_dev[i]}\n{tgt_name}: {tgt_dev[i]}\n\n" for i in range(args.shots))
             head = f"Translate the following sentences from {src_name} to {tgt_name}.\n\n" + shots
             hyps = []
@@ -125,7 +128,6 @@ def task_mt(model, tok, with_ngram, args):
                 gen = greedy(model, ids, args.new_tokens, eos | newline)
                 hyps.append(tok.decode(gen, skip_special_tokens=True).split("\n")[0].strip())
             refs = list(tgt_test[: args.mt_n])
-            key = f"{'eng' if src_name == 'English' else code}->{'eng' if tgt_name == 'English' else code}"
             out["chrf"][key] = sacrebleu.corpus_chrf(hyps, [refs], word_order=2).score
             out["samples"][key] = [{"hyp": h, "ref": r} for h, r in zip(hyps[:5], refs[:5])]
             log(f"mt {key}: chrF++ {out['chrf'][key]:.2f}")
@@ -161,6 +163,11 @@ def main():
     ap.add_argument("--max-len", type=int, default=1024)
     ap.add_argument("--shots", type=int, default=3)
     ap.add_argument("--mt-n", type=int, default=100, help="devtest sentences per translation direction")
+    ap.add_argument(
+        "--mt-dirs",
+        type=lambda v: set(v.split(",")),
+        help="comma-separated directions to run (e.g. eng->zsm_Latn); default all",
+    )
     ap.add_argument("--new-tokens", type=int, default=192)
     # 262k-vocab logits: a batch of 8 x 2048 tokens is already ~8 GB in bf16.
     ap.add_argument("--batch-size", type=int, default=8)
