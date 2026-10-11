@@ -99,8 +99,8 @@ import glob, json, os, re, sys
 
 E = sys.argv[1]
 want = 24
-for spec in sorted(glob.glob(f"{E}/done/1_*__mt.job.split")):
-    job = os.path.basename(spec)[: -len(".job.split")]
+for spec in sorted(glob.glob(f"{E}/done/1_*__mt.split")):
+    job = os.path.basename(spec)[: -len(".split")]
     name, weights, yaml_path, _ = open(spec).read().strip().split("|")
     chrf, samples = {}, {}
     for line in open(f"{E}/logs/{job}.log", errors="replace"):
