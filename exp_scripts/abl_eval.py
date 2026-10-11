@@ -23,7 +23,6 @@ import os
 import time
 
 import pandas as pd
-import torch
 import yaml
 from ngram_infer_eval import build, doc_nll, greedy, log, sample_docs, set_ngram
 from transformers import AutoTokenizer
