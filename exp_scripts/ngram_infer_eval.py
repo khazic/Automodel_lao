@@ -26,11 +26,12 @@ def log(msg):
 
 
 def build(base, weights_dir, with_ngram):
+    """with_ngram: True for the main run's NGRAM config, a config dict for another arm, falsy for none."""
     cfg = AutoConfig.from_pretrained(base)
     cfg.torch_dtype = torch.bfloat16
     torch.set_default_dtype(torch.bfloat16)
     with torch.device("cuda"):
-        model = Gemma4ForConditionalGeneration(cfg, ngram_config=NGRAM if with_ngram else None)
+        model = Gemma4ForConditionalGeneration(cfg, ngram_config=NGRAM if with_ngram is True else (with_ngram or None))
     torch.set_default_dtype(torch.float32)
     sd = {}
     for f in sorted(glob.glob(os.path.join(weights_dir, "*.safetensors"))):
@@ -39,8 +40,14 @@ def build(base, weights_dir, with_ngram):
     missing = [k for k in missing if k != "lm_head.weight"]
     # The base release still ships k/v projections for the KV-shared layers,
     # which the HF model does not build.
-    unexpected = [k for k in unexpected if not k.endswith(("self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"))]
-    log(f"loaded {len(sd)} tensors from {weights_dir}; missing={missing[:8]} ({len(missing)}) unexpected={unexpected[:8]} ({len(unexpected)})")
+    unexpected = [
+        k
+        for k in unexpected
+        if not k.endswith(("self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"))
+    ]
+    log(
+        f"loaded {len(sd)} tensors from {weights_dir}; missing={missing[:8]} ({len(missing)}) unexpected={unexpected[:8]} ({len(unexpected)})"
+    )
     if missing or unexpected:
         raise SystemExit("state dict mismatch")
     model.tie_weights()
@@ -87,7 +94,7 @@ def greedy(model, ids, new_tokens, eos):
         x = torch.cat([x, nxt.view(1, 1)], dim=1)
         if nxt.item() in eos:
             break
-    return x[0, len(ids):].tolist()
+    return x[0, len(ids) :].tolist()
 
 
 def set_ngram(model, enabled):
@@ -115,17 +122,39 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.base)
     docs = sample_docs(args.data, args.per_source)
     log("sampled: " + ", ".join(f"{k}={len(v)}" for k, v in sorted(docs.items())))
-    enc = {k: [[tok.bos_token_id] + tok(t, add_special_tokens=False).input_ids[: args.max_len - 1] for t in v] for k, v in docs.items()}
+    enc = {
+        k: [[tok.bos_token_id] + tok(t, add_special_tokens=False).input_ids[: args.max_len - 1] for t in v]
+        for k, v in docs.items()
+    }
 
     prompts = []
-    for src in ["malay", "indonesian", "thai", "vietnamese", "khmer", "lao", "myanmar", "tamil", "filipino", "tibetan", "uighur", "mongolian"]:
+    for src in [
+        "malay",
+        "indonesian",
+        "thai",
+        "vietnamese",
+        "khmer",
+        "lao",
+        "myanmar",
+        "tamil",
+        "filipino",
+        "tibetan",
+        "uighur",
+        "mongolian",
+    ]:
         if src in docs:
             prompts.append((src, [tok.bos_token_id] + tok(docs[src][0], add_special_tokens=False).input_ids[:48]))
     for src, text in [
         ("en_qa", "Question: What is the capital of Malaysia, and what is it known for?\nAnswer:"),
         ("zh_qa", "问题：请简要介绍一下泰国的首都。\n回答："),
-        ("translate", "Translate the following English sentence into Malay.\nEnglish: The weather is very hot today, so we stayed at home.\nMalay:"),
-        ("translate_th", "Translate the following English sentence into Thai.\nEnglish: Where is the nearest train station?\nThai:"),
+        (
+            "translate",
+            "Translate the following English sentence into Malay.\nEnglish: The weather is very hot today, so we stayed at home.\nMalay:",
+        ),
+        (
+            "translate_th",
+            "Translate the following English sentence into Thai.\nEnglish: Where is the nearest train station?\nThai:",
+        ),
     ]:
         prompts.append((src, [tok.bos_token_id] + tok(text, add_special_tokens=False).input_ids))
 
