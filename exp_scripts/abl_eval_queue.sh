@@ -61,7 +61,8 @@ free_gpu() {
 
 occupy_gpu() {
     local g=$1
-    ( cd $L/openrlhf && exec setsid nohup bash $L/openrlhf/keep_gpu_busy.sh "$g" 0.8 0.8 >> "$L/runs/zhanka_$(hostname -I | cut -d' ' -f1)_gpu$g.log" 2>&1 < /dev/null & )
+    # The worker's CUDA_VISIBLE_DEVICES would leave the occupier seeing one GPU only.
+    ( cd $L/openrlhf && exec env -u CUDA_VISIBLE_DEVICES setsid nohup bash $L/openrlhf/keep_gpu_busy.sh "$g" 0.8 0.8 >> "$L/runs/zhanka_$(hostname -I | cut -d' ' -f1)_gpu$g.log" 2>&1 < /dev/null & )
 }
 
 worker() {

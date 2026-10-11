@@ -51,9 +51,14 @@ plan() {
 
 occupy_when_idle() {
     local g=$1
-    while nvidia-smi -i "$g" --query-compute-apps=pid --format=csv,noheader | grep -q .; do sleep 60; done
-    ps -eo args | grep -qE "^bash (\S*/)?keep_gpu_busy\.sh \"?$g\"? " && return
-    ( cd $L/openrlhf && exec setsid nohup bash $L/openrlhf/keep_gpu_busy.sh "$g" 0.8 0.8 >> "$L/runs/zhanka_$(hostname -I | cut -d' ' -f1)_gpu$g.log" 2>&1 < /dev/null & )
+    # Check for an occupier first: once one runs, the GPU never looks idle again.
+    while true; do
+        ps -eo args | grep -qE "^bash (\S*/)?keep_gpu_busy\.sh \"?$g\"? " && return
+        nvidia-smi -i "$g" --query-compute-apps=pid --format=csv,noheader | grep -q . || break
+        sleep 60
+    done
+    # The worker's CUDA_VISIBLE_DEVICES would leave the occupier seeing one GPU only.
+    ( cd $L/openrlhf && exec env -u CUDA_VISIBLE_DEVICES setsid nohup bash $L/openrlhf/keep_gpu_busy.sh "$g" 0.8 0.8 >> "$L/runs/zhanka_$(hostname -I | cut -d' ' -f1)_gpu$g.log" 2>&1 < /dev/null & )
 }
 
 worker() {
