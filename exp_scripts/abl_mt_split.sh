@@ -107,7 +107,7 @@ for spec in sorted(glob.glob(f"{E}/done/1_*__mt.job.split")):
         m = re.search(r"mt (\S+->\S+): chrF\+\+ ([0-9.]+)", line)
         if m:
             chrf[m.group(1)] = float(m.group(2))
-    for part in glob.glob(f"{E}/results_mt/{name}__p*.json"):
+    for part in glob.glob(f"{E}/results_mt/*{name}__p*.json"):
         r = json.load(open(part))
         chrf.update(r["chrf"])
         samples.update(r["samples"])
