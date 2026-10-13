@@ -232,22 +232,28 @@ class Gemma4NGramEmbedding(nn.Module):
         """Draw the table from ``N(0, initializer_range^2)``."""
         nn.init.normal_(self.table.weight, mean=0.0, std=self.config.initializer_range)
 
-    def _shift_right_within_segment(self, input_ids: torch.Tensor, shift: int) -> torch.Tensor:
-        """Read the token ``shift`` positions back without crossing a segment start.
+    def positions_in_segment(self, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Return how many positions every token lies after the start of its segment.
 
-        A segment starts at the first position after an EOS token. Positions whose
-        source lies before their segment start (or before the sequence start) read
-        the first configured EOS id instead.
+        A segment starts at the sequence start and at the first position after an
+        EOS token. When ``position_ids`` are given, a segment also starts wherever
+        they restart: sequence packing restarts them at every packed document, so
+        neither the hash context nor the convolution reaches into the previous
+        document, matching what the document sees when it runs alone.
 
         Args:
             input_ids: Integer tensor of shape ``[batch, sequence]``.
-            shift: Number of positions to look back; ``0`` returns ``input_ids``.
+            position_ids: Optional integer tensor of the same shape that counts up
+                by one inside every document.
 
         Returns:
-            Integer tensor of shape ``[batch, sequence]``.
+            Long tensor of shape ``[batch, sequence]``; ``0`` marks a segment start.
         """
-        if shift == 0:
-            return input_ids
+        if position_ids is not None and position_ids.shape != input_ids.shape:
+            raise ValueError(
+                "position_ids must share the [batch, sequence] shape of input_ids, got "
+                f"{tuple(position_ids.shape)} and {tuple(input_ids.shape)}"
+            )
         batch_size, sequence_length = input_ids.shape
         positions = torch.arange(sequence_length, device=input_ids.device, dtype=torch.long)
         is_eos = torch.isin(input_ids, self.eos_token_ids)
@@ -257,14 +263,37 @@ class Gemma4NGramEmbedding(nn.Module):
             [eos_positions.new_full((batch_size, 1), -1), previous_eos_inclusive[:, :-1]],
             dim=1,
         )
-        positions_in_segment = positions.unsqueeze(0) - (previous_eos + 1)
-        source_positions = positions - shift
+        offsets = positions.unsqueeze(0) - (previous_eos + 1)
+        if position_ids is None:
+            return offsets
+        # Both offsets count from their own segment start; the later start wins.
+        return torch.minimum(offsets, position_ids.to(device=offsets.device, dtype=torch.long))
+
+    def _shift_right_within_segment(
+        self, input_ids: torch.Tensor, positions_in_segment: torch.Tensor, shift: int
+    ) -> torch.Tensor:
+        """Read the token ``shift`` positions back without crossing a segment start.
+
+        Positions whose source lies before their segment start read the first
+        configured EOS id instead.
+
+        Args:
+            input_ids: Integer tensor of shape ``[batch, sequence]``.
+            positions_in_segment: Output of :meth:`positions_in_segment` for ``input_ids``.
+            shift: Number of positions to look back; ``0`` returns ``input_ids``.
+
+        Returns:
+            Integer tensor of shape ``[batch, sequence]``.
+        """
+        if shift == 0:
+            return input_ids
+        batch_size, sequence_length = input_ids.shape
+        source_positions = torch.arange(sequence_length, device=input_ids.device, dtype=torch.long) - shift
         gather_positions = source_positions.clamp_min(0).unsqueeze(0).expand(batch_size, -1)
         shifted_ids = input_ids.gather(dim=1, index=gather_positions)
-        valid = (positions_in_segment >= shift) & (source_positions.unsqueeze(0) >= 0)
-        return torch.where(valid, shifted_ids, self.eos_token_ids[0])
+        return torch.where(positions_in_segment >= shift, shifted_ids, self.eos_token_ids[0])
 
-    def hash_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def hash_input_ids(self, input_ids: torch.Tensor, positions_in_segment: torch.Tensor | None = None) -> torch.Tensor:
         """Map every token to one packed table row per hash head.
 
         Hashing multiplies each n-gram position by a fixed odd int64 multiplier,
@@ -273,6 +302,8 @@ class Gemma4NGramEmbedding(nn.Module):
 
         Args:
             input_ids: Integer tensor of shape ``[batch, sequence]``.
+            positions_in_segment: Output of :meth:`positions_in_segment`; computed
+                from ``input_ids`` alone (EOS boundaries only) when omitted.
 
         Returns:
             Row ids of shape ``[batch, sequence, num_heads]``, ordered by n-gram
@@ -284,9 +315,13 @@ class Gemma4NGramEmbedding(nn.Module):
         if input_ids.is_floating_point() or input_ids.dtype == torch.bool:
             raise ValueError(f"input_ids must have an integer dtype, got {input_ids.dtype}")
         input_ids = input_ids.to(dtype=torch.long)
+        if positions_in_segment is None:
+            positions_in_segment = self.positions_in_segment(input_ids)
         ngram_size = self.config.ngram_size
         heads_per_ngram = self.config.heads_per_ngram
-        shifted = [self._shift_right_within_segment(input_ids, shift) for shift in range(ngram_size)]
+        shifted = [
+            self._shift_right_within_segment(input_ids, positions_in_segment, shift) for shift in range(ngram_size)
+        ]
         blocks = []
         for order in range(2, ngram_size + 1):
             head_start = (order - 2) * heads_per_ngram
@@ -299,17 +334,18 @@ class Gemma4NGramEmbedding(nn.Module):
             blocks.append(torch.remainder(mixed.unsqueeze(-1), sizes) + offsets)
         return torch.cat(blocks, dim=-1)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, positions_in_segment: torch.Tensor | None = None) -> torch.Tensor:
         """Look up the concatenated head values of every token.
 
         Args:
             input_ids: Integer tensor of shape ``[batch, sequence]``.
+            positions_in_segment: Optional output of :meth:`positions_in_segment`.
 
         Returns:
             Tensor of shape ``[batch, sequence, embed_dim]`` in the table dtype,
             where the last axis concatenates the heads in hash order.
         """
-        rows = self.hash_input_ids(input_ids)
+        rows = self.hash_input_ids(input_ids, positions_in_segment)
         return self.table(rows).flatten(start_dim=-2)
 
 
@@ -351,10 +387,11 @@ class Gemma4NGramInjection(nn.Module):
             dtype=dtype,
         )
         self.conv_dilation = config.ngram_size
-        # Raw token ids of the forward in flight, stashed by the owning model so
-        # the decoder-layer pre-hook can hash them, including during activation
-        # checkpoint replay in backward.
+        # Raw token ids (and position ids, when the batch is packed) of the forward
+        # in flight, stashed by the owning model so the decoder-layer pre-hook can
+        # hash them, including during activation checkpoint replay in backward.
         self._current_input_ids: torch.Tensor | None = None
+        self._current_position_ids: torch.Tensor | None = None
         self.reset_parameters()
 
     @torch.no_grad()
@@ -368,33 +405,47 @@ class Gemma4NGramInjection(nn.Module):
         self.norm_conv.reset_parameters()
         nn.init.zeros_(self.conv1d.weight)
 
-    def _causal_short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the dilated depthwise convolution with zero left history.
+    def _causal_short_conv(self, hidden_states: torch.Tensor, positions_in_segment: torch.Tensor) -> torch.Tensor:
+        """Apply the dilated depthwise convolution with zero history at every segment start.
+
+        Tap ``k`` reads the position ``(kernel_size - 1 - k) * dilation`` steps
+        back, the layout of a left-padded ``F.conv1d``. A tap that would reach
+        before the token's segment start reads zero, so a packed document gets
+        the same output as when it runs alone.
 
         Args:
             hidden_states: Tensor of shape ``[batch, sequence, hidden]``.
+            positions_in_segment: Long tensor of shape ``[batch, sequence]`` from
+                :meth:`Gemma4NGramEmbedding.positions_in_segment`.
 
         Returns:
             Tensor of shape ``[batch, sequence, hidden]`` where every position
-            only depends on itself and earlier positions.
+            only depends on itself and earlier positions of its segment.
         """
-        left_padding = (self.config.conv_kernel_size - 1) * self.conv_dilation
-        channels_first = F.pad(hidden_states.transpose(1, 2), (left_padding, 0))
-        convolved = F.conv1d(
-            channels_first,
-            self.conv1d.weight.to(dtype=channels_first.dtype),
-            groups=self.hidden_size,
-            dilation=self.conv_dilation,
-        )
-        return convolved.transpose(1, 2)
+        kernel_size = self.config.conv_kernel_size
+        sequence_length = hidden_states.shape[1]
+        weight = self.conv1d.weight.to(dtype=hidden_states.dtype)
+        convolved = torch.zeros_like(hidden_states)
+        for tap in range(kernel_size):
+            shift = (kernel_size - 1 - tap) * self.conv_dilation
+            if shift >= sequence_length:
+                continue
+            shifted = F.pad(hidden_states[:, : sequence_length - shift], (0, 0, shift, 0))
+            shifted = torch.where((positions_in_segment >= shift).unsqueeze(-1), shifted, 0.0)
+            convolved = convolved + shifted * weight[:, 0, tap]
+        return convolved
 
-    def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor, position_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Compute the delta to add to the residual stream before the injection layer.
 
         Args:
             hidden_states: Residual stream of shape ``[batch, sequence, hidden]``.
             input_ids: Integer tensor of shape ``[batch, sequence]`` with the raw
                 tokenizer ids of the same positions.
+            position_ids: Optional integer tensor of shape ``[batch, sequence]``;
+                where they restart (packed documents) a new segment begins.
 
         Returns:
             Delta of shape ``[batch, sequence, hidden]`` in the dtype of
@@ -409,7 +460,8 @@ class Gemma4NGramInjection(nn.Module):
                 "input_ids and hidden_states must share [batch, sequence] axes, got "
                 f"{tuple(input_ids.shape)} and {tuple(hidden_states.shape)}"
             )
-        embeddings = self.embedding(input_ids).to(dtype=hidden_states.dtype)
+        positions_in_segment = self.embedding.positions_in_segment(input_ids, position_ids)
+        embeddings = self.embedding(input_ids, positions_in_segment).to(dtype=hidden_states.dtype)
         key = self.key_proj(embeddings)
         value = self.value_proj(embeddings)
         gate = (self.norm_key(key) * self.norm_query(hidden_states)).sum(dim=-1, keepdim=True)
@@ -417,17 +469,20 @@ class Gemma4NGramInjection(nn.Module):
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gate = torch.sigmoid(gate)
         gated_value = gate * value
-        return gated_value + self._causal_short_conv(self.norm_conv(gated_value))
+        return gated_value + self._causal_short_conv(self.norm_conv(gated_value), positions_in_segment)
 
-    def stash_input_ids(self, input_ids: torch.Tensor | None) -> None:
+    def stash_input_ids(self, input_ids: torch.Tensor | None, position_ids: torch.Tensor | None = None) -> None:
         """Record the raw ids of the forward in flight for the decoder-layer hook.
 
         Args:
             input_ids: Integer tensor of shape ``[batch, sequence]``, or ``None``
                 to clear the stash. The tensor is detached and kept until the next
                 call, so activation-checkpoint replay reads the same ids.
+            position_ids: Optional position ids of the same forward; a packed
+                batch restarts them at every document.
         """
         self._current_input_ids = None if input_ids is None else input_ids.detach()
+        self._current_position_ids = None if position_ids is None else position_ids.detach()
 
     def decoder_layer_pre_hook(self, _layer: nn.Module, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         """Add the n-gram delta to the hidden states entering the injection layer.
@@ -451,12 +506,13 @@ class Gemma4NGramInjection(nn.Module):
                 "The Gemma4 n-gram injection needs raw input_ids: run the model forward with input_ids "
                 "(inputs_embeds alone cannot be hashed)"
             )
+        input_ids, position_ids = self._current_input_ids, self._current_position_ids
         if args:
             hidden_states = args[0]
-            return (hidden_states + self(hidden_states, self._current_input_ids), *args[1:]), kwargs
+            return (hidden_states + self(hidden_states, input_ids, position_ids), *args[1:]), kwargs
         hidden_states = kwargs["hidden_states"]
         kwargs = dict(kwargs)
-        kwargs["hidden_states"] = hidden_states + self(hidden_states, self._current_input_ids)
+        kwargs["hidden_states"] = hidden_states + self(hidden_states, input_ids, position_ids)
         return args, kwargs
 
     def extra_repr(self) -> str:

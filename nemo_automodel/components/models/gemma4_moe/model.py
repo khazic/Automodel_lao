@@ -1307,7 +1307,7 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
                 raise NotImplementedError(
                     "Gemma4 n-gram injection has not been wired for context or tensor parallelism"
                 )
-            ngram.stash_input_ids(input_ids)
+            ngram.stash_input_ids(input_ids, position_ids)
         if not getattr(text_config, "enable_moe_block", False):
             per_layer_inputs = kwargs.pop("per_layer_inputs", None)
             if cp_enabled or tp_e_series_enabled:

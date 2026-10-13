@@ -149,6 +149,30 @@ class TestEmbedding:
         assert torch.equal(rows[0, 0], rows[0, 7])
         assert torch.equal(rows[0, 1], rows[0, 8])
 
+    def test_position_id_restart_starts_a_new_segment(self):
+        embedding = Gemma4NGramEmbedding(_tiny_ngram_config())
+        # Two packed documents without any EOS between them: the restart of the
+        # position ids alone must cut the context, as if the second ran alone.
+        ids = torch.tensor([[7, 9, 5, 3, 7, 9, 5]])
+        position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2]])
+        offsets = embedding.positions_in_segment(ids, position_ids)
+        assert offsets.tolist() == [[0, 1, 2, 3, 0, 1, 2]]
+        rows = embedding.hash_input_ids(ids, offsets)
+        torch.testing.assert_close(rows[:, 4:], embedding.hash_input_ids(ids[:, 4:]))
+        assert not torch.equal(rows[0, 4], embedding.hash_input_ids(ids)[0, 4])
+
+    def test_eos_and_position_restarts_combine(self):
+        embedding = Gemma4NGramEmbedding(_tiny_ngram_config())
+        ids = torch.tensor([[4, EOS, 6, 8, 3, 5]])
+        position_ids = torch.tensor([[0, 1, 2, 3, 0, 1]])
+        assert embedding.positions_in_segment(ids, position_ids).tolist() == [[0, 1, 0, 1, 0, 1]]
+        assert embedding.positions_in_segment(ids).tolist() == [[0, 1, 0, 1, 2, 3]]
+
+    def test_mismatched_position_ids_are_rejected(self):
+        embedding = Gemma4NGramEmbedding(_tiny_ngram_config())
+        with pytest.raises(ValueError, match="position_ids"):
+            embedding.positions_in_segment(torch.zeros(2, 4, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long))
+
     def test_bigram_heads_ignore_the_third_token(self):
         config = _tiny_ngram_config()
         embedding = Gemma4NGramEmbedding(config)
@@ -211,6 +235,41 @@ class TestInjection:
         perturbed = injection(perturbed_hidden, ids)
         torch.testing.assert_close(perturbed[:, :9], reference[:, :9])
 
+    def test_convolution_matches_left_padded_conv1d_inside_one_segment(self):
+        config = _tiny_ngram_config()
+        injection = Gemma4NGramInjection(config, hidden_size=16)
+        with torch.no_grad():
+            injection.conv1d.weight.normal_()
+        hidden = torch.randn(2, 10, 16)
+        left_padding = (config.conv_kernel_size - 1) * injection.conv_dilation
+        expected = torch.nn.functional.conv1d(
+            torch.nn.functional.pad(hidden.transpose(1, 2), (left_padding, 0)),
+            injection.conv1d.weight,
+            groups=16,
+            dilation=injection.conv_dilation,
+        ).transpose(1, 2)
+        offsets = torch.arange(10).expand(2, -1)
+        torch.testing.assert_close(injection._causal_short_conv(hidden, offsets), expected)
+
+    @pytest.mark.parametrize("boundary", ["position_ids", "eos"])
+    def test_packed_documents_match_running_alone(self, boundary):
+        injection = Gemma4NGramInjection(_tiny_ngram_config(), hidden_size=16)
+        with torch.no_grad():
+            injection.value_proj.weight.normal_()
+            injection.conv1d.weight.normal_()
+        first = torch.randint(3, 64, (1, 9))
+        if boundary == "eos":
+            first[0, -1] = EOS
+        second = torch.randint(3, 64, (1, 11))
+        packed = torch.cat([first, second], dim=1)
+        position_ids = (
+            torch.cat([torch.arange(9), torch.arange(11)]).unsqueeze(0) if boundary == "position_ids" else None
+        )
+        hidden = torch.randn(1, 20, 16)
+        delta = injection(hidden, packed, position_ids)
+        torch.testing.assert_close(delta[:, :9], injection(hidden[:, :9], first))
+        torch.testing.assert_close(delta[:, 9:], injection(hidden[:, 9:], second))
+
     def test_shape_mismatches_are_rejected(self):
         injection = Gemma4NGramInjection(_tiny_ngram_config(), hidden_size=16)
         with pytest.raises(ValueError, match="hidden_states"):
@@ -229,6 +288,21 @@ class TestInjection:
         assert args[1] is None and kwargs == {"k": 1}
         args, kwargs = injection.decoder_layer_pre_hook(torch.nn.Identity(), (), {"hidden_states": hidden})
         assert args == () and kwargs["hidden_states"] is not hidden
+
+    def test_hook_applies_stashed_position_ids(self):
+        injection = Gemma4NGramInjection(_tiny_ngram_config(), hidden_size=16)
+        with torch.no_grad():
+            injection.value_proj.weight.normal_()
+            injection.conv1d.weight.normal_()
+        ids = torch.randint(3, 64, (1, 8))
+        position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+        hidden = torch.randn(1, 8, 16)
+        injection.stash_input_ids(ids, position_ids)
+        (packed,), _ = injection.decoder_layer_pre_hook(torch.nn.Identity(), (hidden,), {})
+        torch.testing.assert_close(packed, hidden + injection(hidden, ids, position_ids))
+        injection.stash_input_ids(ids)
+        (unpacked,), _ = injection.decoder_layer_pre_hook(torch.nn.Identity(), (hidden,), {})
+        assert not torch.allclose(packed[:, 4:], unpacked[:, 4:])
 
 
 class TestDenseGemma4Integration:
@@ -264,6 +338,17 @@ class TestDenseGemma4Integration:
         model._ngram_hook_handle.remove()
         with torch.no_grad():
             torch.testing.assert_close(model(input_ids=ids).logits, before)
+
+    def test_forward_hands_position_ids_to_the_hook(self):
+        model = _build_dense_model(_tiny_ngram_config())
+        ids = torch.randint(3, 64, (1, 8))
+        position_ids = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]])
+        with torch.no_grad():
+            model(input_ids=ids, position_ids=position_ids)
+        assert torch.equal(model.ngram._current_position_ids, position_ids)
+        with torch.no_grad():
+            model(input_ids=ids)
+        assert model.ngram._current_position_ids is None
 
     def test_gradient_reaches_table_through_the_decoder(self):
         model = _build_dense_model(_tiny_ngram_config())
