@@ -406,15 +406,30 @@ def _run_gemma4_flex_chunk(
             if flex_scale is None:
                 flex_scale = 1.0 / math.sqrt(orig_head_dim)
 
+        import os as _os  # EXPERIMENT
+
+        upcast = bool(_os.environ.get("GEMMA4_CP_FP32_ALL")) or (
+            bool(_os.environ.get("GEMMA4_CP_FP32_GLOBAL")) and getattr(attention_module, "sliding_window", None) is None
+        )
+        if upcast:
+            query_for_flex = query_for_flex.float()
+            key_for_flex = key_for_flex.float()
+            value_for_flex = value_for_flex.float()
         flex_kwargs = {"block_mask": block_mask, "scale": flex_scale, "enable_gqa": ctx.enable_gqa}
-        if use_small_flex_blocks:
+        if upcast and not use_small_flex_blocks:
             flex_kwargs["kernel_options"] = {
-                "BLOCK_M": 32,
-                "BLOCK_N": 32,
-                "BLOCK_M1": 32,
-                "BLOCK_N1": 32,
-                "BLOCK_M2": 32,
-                "BLOCK_N2": 32,
+                "BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_M1": 32, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 32,
+                "num_stages": 1, "num_warps": 4,
+            }
+        if use_small_flex_blocks:
+            blk = 16 if upcast else 32
+            flex_kwargs["kernel_options"] = {
+                "BLOCK_M": blk,
+                "BLOCK_N": blk,
+                "BLOCK_M1": blk,
+                "BLOCK_N1": blk,
+                "BLOCK_M2": blk,
+                "BLOCK_N2": blk,
                 "num_stages": 1,
                 "num_warps": 4,
             }
