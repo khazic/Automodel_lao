@@ -217,6 +217,19 @@ def main() -> int:
                     f"dq {_err(dq, dq_ref)} | dk {_err(dk, dk_ref)} | dv {_err(dv, dv_ref)}",
                     flush=True,
                 )
+                if torch.cuda.get_device_capability()[0] == 8:
+                    # Hypothesis check: the SM80 Split-D backward accumulates dK/dV through an HBM buffer in
+                    # the activation dtype; its grad_kv_storage_dtype option widens that buffer to fp32.
+                    from ffpa_attn.cute import _ffpa_attn_backward_cute
+
+                    dq32, dk32, dv32 = _ffpa_attn_backward_cute(
+                        g, qs, ks, vs, o, lse, scale, causal, grad_kv_storage_dtype=torch.float32
+                    )
+                    print(
+                        f"[dense causal={causal} fp32-kv-storage] S={S}: dq {_err(dq32, dq_ref)} | "
+                        f"dk {_err(dk32, dk_ref)} | dv {_err(dv32, dv_ref)}",
+                        flush=True,
+                    )
     dist.barrier()
     dist.destroy_process_group()
     return 0
